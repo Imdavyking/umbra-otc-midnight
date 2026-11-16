@@ -1,31 +1,24 @@
+import type { MidnightProviders } from "@midnight-ntwrk/midnight-js-types";
+import type { ConnectedAPI } from "@midnightntwrk/dapp-connector-api";
+
+export type ContractKind = "htlc";
+
+// Everything except the per-contract private state store
+export type BaseProviders = Omit<MidnightProviders, "privateStateProvider">;
+
+// `uris` is gone: the wallet now owns the prover/indexer config
+export type WalletAndProvider = {
+  wallet: ConnectedAPI;
+  providers: BaseProviders;
+};
+
+
 import type { HtlcAPI } from "@umbra-otc/api";
-import type {
-  DAppConnectorWalletAPI,
-  ServiceUriConfig,
-} from "@midnight-ntwrk/dapp-connector-api";
-
-/** Everything a provider set needs except the per-contract private-state store. */
-export type BaseProviders = Omit<HtlcAPI, "privateStateProvider">;
-
-export interface WalletAndProvider {
-  readonly wallet: DAppConnectorWalletAPI;
-  readonly uris: ServiceUriConfig;
-  readonly providers: BaseProviders;
-}
-
-export interface WalletAPI {
-  wallet: DAppConnectorWalletAPI;
-  coinPublicKey: string;
-  encryptionPublicKey: string;
-  uris: ServiceUriConfig;
-}
-
-export type ContractKind = "otc" | "pool" | "htlc";
 
 export type ApiFor<K extends ContractKind> = K extends "htlc" ? HtlcAPI : never;
 
-export interface ContractSlot<K extends ContractKind> {
-  status: "idle" | "joining" | "joined" | "failed";
-  api?: ApiFor<K>;
-  error?: string;
-}
+export type ContractSlot<K extends ContractKind> =
+  | { status: "idle" }
+  | { status: "joining" }
+  | { status: "joined"; api: ApiFor<K> }
+  | { status: "failed"; error: string };
