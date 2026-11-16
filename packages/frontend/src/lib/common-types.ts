@@ -1,14 +1,11 @@
-import type {
-
-  HtlcAPI,
-} from "@umbra-otc/api";
+import type { HtlcAPI } from "@umbra-otc/api";
 import type {
   DAppConnectorWalletAPI,
   ServiceUriConfig,
 } from "@midnight-ntwrk/dapp-connector-api";
 
 /** Everything a provider set needs except the per-contract private-state store. */
-export type BaseProviders = Omit<OtcProviders, "privateStateProvider">;
+export type BaseProviders = Omit<HtlcAPI, "privateStateProvider">;
 
 export interface WalletAndProvider {
   readonly wallet: DAppConnectorWalletAPI;
@@ -25,11 +22,7 @@ export interface WalletAPI {
 
 export type ContractKind = "otc" | "pool" | "htlc";
 
-export type ApiFor<K extends ContractKind> = K extends "otc"
-  ? OtcAPI
-  : K extends "pool"
-  ? PoolAPI
-  : HtlcAPI;
+export type ApiFor<K extends ContractKind> = K extends "htlc" ? HtlcAPI : never;
 
 export interface ContractSlot<K extends ContractKind> {
   status: "idle" | "joining" | "joined" | "failed";

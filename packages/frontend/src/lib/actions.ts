@@ -36,7 +36,6 @@ import {
   getZswapNetworkId,
 } from "@midnight-ntwrk/midnight-js-network-id";
 
-import type { OtcProviders } from "@umbra-otc/api";
 import type { BaseProviders, WalletAndProvider } from "./common-types";
 
 // -------------------------
@@ -178,4 +177,4 @@ export const withPrivateState = <P>(
     }),
   }) as unknown as P;
 
-export type { OtcProviders };
+
