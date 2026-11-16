@@ -2,22 +2,10 @@ import { Link } from "react-router-dom";
 
 const cards = [
   {
-    to: "/otc",
-    icon: "⚖️",
-    title: "OTC auction",
-    body: "Sealed-bid batch auction. Commit hidden orders, reveal, and everyone clears at one uniform price. No front-running, no identity on-chain.",
-  },
-  {
-    to: "/pool",
-    icon: "🕶️",
-    title: "Private pool",
-    body: "Deposit a fixed amount and withdraw to any address with a zero-knowledge proof. Nothing links the two transactions.",
-  },
-  {
     to: "/htlc",
     icon: "🔗",
     title: "HTLC swap",
-    body: "Hash-time-locked escrow for atomic swaps with another chain. Revealing the secret settles both legs; otherwise refund after expiry.",
+    body: "Hash-time-locked escrow for atomic swaps. Revealing the secret settles both legs; otherwise refund after expiry.",
   },
 ];
 
@@ -27,8 +15,8 @@ export default function Home() {
       <header className="text-center px-6 pt-20 pb-12 bg-gradient-to-r from-indigo-800 via-purple-700 to-blue-700 text-white">
         <h1 className="text-5xl font-bold mb-4">Umbra OTC</h1>
         <p className="text-xl max-w-2xl mx-auto">
-          Private trading on Midnight: sealed-bid auctions, a shielded pool, and atomic swaps.
-          Prove what is needed, reveal nothing more.
+          Private trading on Midnight: atomic swaps. Prove what is needed,
+          reveal nothing more.
         </p>
       </header>
 

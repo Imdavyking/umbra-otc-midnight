@@ -6,8 +6,6 @@ import ConnectWalletButton from "./ConnectWalletButton";
 const NavHeader = () => {
   const [menuOpen, setMenuOpen] = useState(false);
   const links = [
-    { to: "/otc", label: "OTC" },
-    { to: "/pool", label: "Pool" },
     { to: "/htlc", label: "HTLC" },
   ];
 
