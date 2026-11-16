@@ -1,0 +1,19 @@
+{
+  "name": "scripts",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "deploy": "node deploy.js",
+    "deploy:new": "node deploy.js --new",
+    "deploy:join": "node deploy.js --join",
+    "generate-key": "node generate-key.js",
+    "faucet": "node request-faucet.js",
+    "balance": "node check-balance.js",
+    "copy-zk-keys": "node copy-zk-keys.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "type": "module"
+}

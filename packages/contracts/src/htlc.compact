@@ -1,0 +1,113 @@
+pragma language_version >= 0.28.0;
+
+import CompactStandardLibrary;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hash-time-locked swap leg on Midnight  (port of Umbra's HTLC swap)
+//
+// Same shape as Umbra's flow, one contract per chain:
+//   Alice: lock(coin, H(secret), bob, alice, expiry_A)    on Midnight
+//   Bob:   lock the counter-asset with the SAME hash on the other chain, shorter expiry
+//   Alice: claim(secret) on the other chain → reveals secret
+//   Bob:   claim(secret) here → receives Alice's coin
+//   either side: refund() after expiry
+//
+// Migrated to Compact language 0.28 / toolchain 0.36 (ledger 9):
+//  • CoinInfo / receive / send → ShieldedCoinInfo / receiveShielded / sendShielded
+//  • amounts are Uint<128>; the escrowed coin is a QualifiedShieldedCoinInfo
+//  • blockTimeGte / blockTimeLt are standard-library circuits (seconds since epoch)
+//
+// No change coins: each lock escrows one whole coin and claim/refund spend exactly that
+// coin's value, so the contract never writes a change coin back (see the ledger-9
+// known issue "Custom error: 104" in pool.compact). The asserts below enforce it.
+//
+// Hashlock: persistentHash is documented as using the SHA-256 compression algorithm.
+// Before pairing this leg with a Bitcoin/EVM counterpart, check on your toolchain that
+// persistentHash<Bytes<32>>(x) equals the counterpart's hash of the same 32 bytes.
+// (keccak256 is now native in the standard library if you need an EVM-style hashlock.)
+//
+// Wallet note: claim and refund pay a shielded coin to a user key without a
+// ciphertext, so the claimant / refund wallet is only informed of the coin when that
+// same wallet submits the claim / refund transaction.
+//
+// NOTE: not compiled in the environment that produced this file — compile it with
+//  `compact compile +0.36.1` before relying on it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct Lock {
+  claimant: ZswapCoinPublicKey,
+  refund_to: ZswapCoinPublicKey,
+  amount: Uint<128>,
+  expiry: Uint<64>   // unix seconds
+}
+
+export ledger locks: Map<Bytes<32>, Lock>;                         // hashlock → terms
+export ledger lock_coins: Map<Bytes<32>, QualifiedShieldedCoinInfo>; // hashlock → escrowed coin
+export ledger revealed: Map<Bytes<32>, Bytes<32>>;                 // hashlock → preimage (public after claim)
+
+export pure circuit hashlock_of(preimage: Bytes<32>): Bytes<32> {
+  return persistentHash<Bytes<32>>(preimage);
+}
+
+export circuit lock(
+  coin: ShieldedCoinInfo,
+  hashlock: Bytes<32>,
+  claimant: ZswapCoinPublicKey,
+  refund_to: ZswapCoinPublicKey,
+  expiry: Uint<64>
+): [] {
+  const h = disclose(hashlock);
+  const c = disclose(coin);
+  const e = disclose(expiry);
+  assert(!locks.member(h), "Hashlock already used");
+  assert(c.value > 0, "Empty coin");
+  assert(blockTimeLt(e), "Expiry is in the past");
+
+  receiveShielded(c);
+  lock_coins.insertCoin(h, c, right<ZswapCoinPublicKey, ContractAddress>(kernel.self()));
+  locks.insert(h, Lock {
+    claimant: disclose(claimant),
+    refund_to: disclose(refund_to),
+    amount: c.value,
+    expiry: e
+  });
+}
+
+// Anyone holding the secret may trigger the claim; funds always go to the claimant.
+export circuit claim(preimage: Bytes<32>): [] {
+  const p = disclose(preimage);
+  const h = hashlock_of(p);
+  assert(locks.member(h), "Unknown hashlock");
+  assert(!revealed.member(h), "Already claimed");
+  assert(lock_coins.member(h), "Already refunded");
+
+  const l = locks.lookup(h);
+  assert(blockTimeLt(l.expiry), "Lock expired");
+
+  const result = sendShielded(
+    lock_coins.lookup(h),
+    left<ZswapCoinPublicKey, ContractAddress>(l.claimant),
+    l.amount
+  );
+  assert(!result.change.is_some, "Unexpected change coin");
+  lock_coins.remove(h);
+  revealed.insert(h, p);   // the counterparty reads this to claim on the other chain
+}
+
+export circuit refund(hashlock: Bytes<32>): [] {
+  const h = disclose(hashlock);
+  assert(locks.member(h), "Unknown hashlock");
+  assert(!revealed.member(h), "Already claimed");
+  assert(lock_coins.member(h), "Already refunded");
+
+  const l = locks.lookup(h);
+  assert(blockTimeGte(l.expiry), "Not expired yet");
+
+  const result = sendShielded(
+    lock_coins.lookup(h),
+    left<ZswapCoinPublicKey, ContractAddress>(l.refund_to),
+    l.amount
+  );
+  assert(!result.change.is_some, "Unexpected change coin");
+  lock_coins.remove(h);
+}
