@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Creates a wallet seed in .env (if none exists) and derives the UNSHIELDED address
 // the Midnight faucet needs. Uses only the wallet SDK 2 key-derivation pieces
-// (hd, ledger/v9, address-format), not the wallet facade, so it does not sync or connect.
+// (hd, unshielded keystore), not the wallet facade, so it does not sync or connect.
 //
 // Safety: an existing WALLET_SEED is never replaced. Other lines in .env are kept, and a
 // copy of the old file is written to .env.bak before any change.
@@ -12,12 +12,7 @@ import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import dotenv from "dotenv";
 import { HDWallet, Roles } from "@midnightntwrk/wallet-sdk/hd";
-import {
-  MidnightBech32m,
-  UnshieldedAddress,
-} from "@midnightntwrk/wallet-sdk/address-format";
 import { createKeystore } from "@midnightntwrk/wallet-sdk/unshielded";
-import * as ledger from "@midnightntwrk/wallet-sdk/ledger/v9";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.resolve(__dirname, "..", "..", ".env");
@@ -45,7 +40,7 @@ function deriveRoleKey(account, role, index = 0) {
   if (index > 20)
     throw new Error("Could not derive a key for the requested role");
   const result = account.selectRole(role).deriveKeyAt(index);
-  if (result.type === "keyDerived") return Buffer.from(result.key);
+  if (result.type === "keyDerived") return Buffer.from(result.key); // copy: survives clear()
   return deriveRoleKey(account, role, index + 1);
 }
 
@@ -66,41 +61,12 @@ function unshieldedAddressFromSeed(seedHex, network) {
   const nightKey = deriveRoleKey(account, Roles.NightExternal);
   created.hdWallet.clear();
 
-  // The HD key is a raw BIP-340 secret key; ledger 9 wants its own signing-key format.
-  // Try the conversion route first, then the SDK's keystore helper, and say which worked.
-  const attempts = [
-    [
-      "signingKeyFromBip340 -> signatureVerifyingKey -> addressFromKey",
-      () => {
-        const signingKey = ledger.signingKeyFromBip340(
-          nightKey.toString("hex"),
-        );
-        const verifyingKey = ledger.signatureVerifyingKey(signingKey);
-        const address = new UnshieldedAddress(
-          Buffer.from(ledger.addressFromKey(verifyingKey), "hex"),
-        );
-        return MidnightBech32m.encode(network, address).toString();
-      },
-    ],
-    [
-      "createKeystore(...).getBech32Address()",
-      () => String(createKeystore(nightKey, network).getBech32Address()),
-    ],
-  ];
-
-  const failures = [];
-  for (const [name, run] of attempts) {
-    try {
-      const result = run();
-      console.log(`🔑 Address derived via: ${name}`);
-      return result;
-    } catch (error) {
-      failures.push(`${name}: ${error.message}`);
-    }
-  }
-  throw new Error(
-    `No derivation route worked:\n   - ${failures.join("\n   - ")}`,
+  // SDK 2.x: createKeystore takes { kind, secret }, not a bare key.
+  const keystore = createKeystore(
+    { kind: "schnorr", secret: nightKey },
+    network,
   );
+  return String(keystore.getBech32Address());
 }
 
 /** Set KEY=value lines in .env, keeping every other line. Backs up the old file first. */
@@ -150,10 +116,6 @@ try {
   console.log("   Back up WALLET_SEED somewhere safe: it cannot be recovered.");
   console.log("\nNext: npm run faucet");
 } catch (error) {
-  console.error("\n❌ Key generation failed:", error.message);
-  console.error(
-    "   If this points at hd, ledger or address-format, paste this output so the",
-  );
-  console.error("   derivation can be adjusted to the installed SDK version.");
+  console.error("\n❌ Key generation failed:", error.stack ?? error.message);
   process.exit(1);
 }

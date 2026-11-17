@@ -133,7 +133,7 @@ class MidnightDeployer {
     console.log("3️⃣ corepack yarn workspace @umbra-otc/api build");
     console.log("   📁 Working directory:", this.projectRoot, "\n");
     console.log(
-      "4️⃣ npm run testnet-remote   (only if packages/cli is built for the ledger 9 stack)",
+      "4️⃣ npm run preview   (only if packages/cli is built for the ledger 9 stack)",
     );
     console.log("   📁 Working directory:", this.cliDir, "\n");
     console.log("💡 Run without --dry-run to execute these commands");
@@ -198,12 +198,7 @@ class MidnightDeployer {
       );
 
       // Step 4: the CLI launcher
-      const launcher = path.join(
-        this.cliDir,
-        "dist",
-        "launcher",
-        "testnet-remote.js",
-      );
+      const launcher = path.join(this.cliDir, "dist", "launcher", "preview.js");
       if (!fs.existsSync(launcher)) {
         console.log("\n✅ Contract compiled and packages built.");
         console.log(
@@ -219,7 +214,7 @@ class MidnightDeployer {
       }
       await this.runCommand(
         "npm",
-        ["run", "testnet-remote"],
+        ["run", "preview"],
         this.cliDir,
         "Connecting to the network and deploying the contract",
         { AUTO_DEPLOY: "true", DEPLOY_MODE: this.deployMode || "new" },

@@ -1,94 +1,55 @@
-// import { webcrypto } from "crypto";
-// import { WebSocket } from "ws"
-import { levelPrivateStateProvider } from "@midnight-ntwrk/midnight-js-level-private-state-provider";
+import { Buffer } from "node:buffer";
 import { stdin as input, stdout as output } from "node:process";
-
-import { ContractAddress } from "@midnight-ntwrk/compact-runtime";
-import { createInterface, Interface } from "node:readline/promises";
-import { Logger } from "pino";
-import { toHex } from "@midnight-ntwrk/midnight-js-utils";
-import { type Config, StandaloneConfig } from "./config.js";
-import {
-  getLedgerNetworkId,
-  getZswapNetworkId,
-} from "@midnight-ntwrk/midnight-js-network-id";
+import { createInterface, type Interface } from "node:readline/promises";
+import { WebSocket } from "ws";
+import dotenv from "dotenv";
 import * as Rx from "rxjs";
-import { type Wallet } from "@midnight-ntwrk/wallet-api";
-import type {
-  StartedDockerComposeEnvironment,
-  DockerComposeEnvironment,
-} from "testcontainers";
-import { type Resource, WalletBuilder } from "@midnight-ntwrk/wallet";
-import { Transaction as ZswapTransaction } from "@midnight-ntwrk/zswap";
+import type { Logger } from "pino";
+
 import {
-  nativeToken,
-  Transaction,
-  type CoinInfo,
-  type TransactionId,
-} from "@midnight-ntwrk/ledger";
+  WalletFacade,
+  ShieldedWallet,
+  DustWallet,
+  UnshieldedWallet,
+  createKeystore,
+  PublicKey,
+  NoOpTransactionHistoryStorage,
+  DustAddress,
+  MidnightBech32m,
+} from "@midnightntwrk/wallet-sdk";
+import { WalletSeeds } from "@midnightntwrk/wallet-sdk-hd";
 import {
-  type MidnightProvider,
-  type WalletProvider,
-  type UnbalancedTransaction,
-  createBalancedTx,
-  type BalancedTransaction,
+  WalletTransaction,
+  ProtocolVersion,
+} from "@midnightntwrk/wallet-sdk-abstractions";
+import * as ledger from "@midnight-ntwrk/midnight-js-protocol/v9";
+import {
+  createLedger9MidnightProvider,
+  createLedger9WalletProvider,
 } from "@midnight-ntwrk/midnight-js-types";
+import { levelPrivateStateProvider } from "@midnight-ntwrk/midnight-js-level-private-state-provider";
 import { indexerPublicDataProvider } from "@midnight-ntwrk/midnight-js-indexer-public-data-provider";
 import { NodeZkConfigProvider } from "@midnight-ntwrk/midnight-js-node-zk-config-provider";
 import { httpClientProofProvider } from "@midnight-ntwrk/midnight-js-http-client-proof-provider";
-import * as fs from "node:fs";
-import { streamToString } from "testcontainers/build/common/streams.js";
-import { webcrypto } from "node:crypto";
-import dotenv from "dotenv";
-import path from "path";
-dotenv.config({ path: path.resolve("..", "..", ".env") });
 
 import {
-
   HtlcAPI,
-
+  makeHtlcCompiledContract,
   HtlcPrivateStateId,
   utils,
-  
   type HtlcProviders,
 } from "@umbra-otc/api";
+import { type Config, envPath } from "./config.js";
 
-export type ContractName = "otc" | "pool" | "htlc";
-type MakeProviders = (name: ContractName) => any;
+// The wallet SDK expects a global WebSocket on Node.
+(globalThis as any).WebSocket = WebSocket;
+dotenv.config({ path: envPath });
+
+export { HtlcPrivateStateId };
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
 
 const ask = async (rli: Interface, q: string) => (await rli.question(q)).trim();
-
-const DEPLOY_OR_JOIN_QUESTION = `
-    You can do one of the following:
-    1. Deploy a new contract
-    2. Join an existing one
-    3. Back
-`;
-
-/** Shared deploy-or-join prompt for all three contracts. */
-const resolveContract = async <A extends { deployedContractAddress: string }>(
-  rli: Interface,
-  logger: Logger,
-  deploy: () => Promise<A>,
-  join: (address: string) => Promise<A>
-): Promise<A | null> => {
-  while (true) {
-    const choice = await ask(rli, DEPLOY_OR_JOIN_QUESTION);
-    if (choice === "3") return null;
-    if (choice === "1" || choice === "2") {
-      const api =
-        choice === "1"
-          ? await deploy()
-          : await join(await ask(rli, "What is the contract address (in hex)? "));
-      logger.info(
-        `${choice === "1" ? "Deployed" : "Joined"} contract at address: ${
-          api.deployedContractAddress
-        }`
-      );
-      return api;
-    }
-  }
-};
 
 const show = (logger: Logger, label: string, value: unknown) =>
   logger.info(
@@ -98,135 +59,301 @@ const show = (logger: Logger, label: string, value: unknown) =>
         typeof v === "bigint"
           ? v.toString()
           : v instanceof Uint8Array
-          ? utils.uint8ArrayToHex(v)
-          : v,
-      2
-    )}`
+            ? utils.uint8ArrayToHex(v)
+            : v,
+      2,
+    )}`,
   );
 
-const afterTx = async (wallet: Wallet, logger: Logger, what: string) => {
-  logger.info(`${what} submitted. Waiting for wallet to sync...`);
-  await waitForWalletSyncAfterOperation(wallet, logger);
-  await displayComprehensiveWalletState(wallet, undefined, logger);
-};
+const formatNight = (raw: bigint) =>
+  `${raw / 1_000_000n}.${(raw % 1_000_000n).toString().padStart(6, "0")}`;
+const formatDust = (raw: bigint) =>
+  `${raw / 1_000_000_000_000_000n}.${(raw % 1_000_000_000_000_000n).toString().padStart(15, "0")}`;
 
-// ─── OTC ─────────────────────────────────────────────────────────────────────
+// ─── Blockfrost endpoints (Preview) ──────────────────────────────────────────
+// Set BLOCKFROST_PROJECT_ID in .env to route the node RPC and the indexer through
+// Blockfrost, the same endpoints Lace uses. Without it, config.ts is used as-is.
+// The key is never logged.
 
-const OTC_QUESTION = `
-OTC sealed-bid auction:
-  1. Show state
-  2. Show my trader leaf (operator whitelists this)
-  3. [operator] Add trader (leaf hex)
-  4. [operator] Open round
-  5. Commit order
-  6. [operator] Close commit phase
-  7. Reveal my order
-  8. Show suggested clearing level
-  9. [operator] Clear round
- 10. Claim fill
- 11. Back
+const withBlockfrost = (config: Config, logger: Logger): Config => {
+  const projectId = (process.env.BLOCKFROST_PROJECT_ID ?? "").trim();
+  if (!projectId) return config;
 
-Which would you like to do? `;
-
-
-
-// ─── Pool ────────────────────────────────────────────────────────────────────
-
-const POOL_QUESTION = `
-Private pool:
-  1. Show state
-  2. Deposit one denomination (creates a note)
-  3. Withdraw active note to an address
-  4. Import a note (JSON)
-  5. Show active note (back it up!)
-  6. Back
-
-Which would you like to do? `;
-
-const poolLoop = async (
-  wallet: Wallet & Resource,
-  providers: PoolProviders,
-  rli: Interface,
-  logger: Logger
-) => {
-  const api = await resolveContract(
-    rli,
-    logger,
-    async () =>
-      PoolAPI.deploy(
-        providers,
-        await ask(rli, "Coin color to accept (32-byte hex): "),
-        BigInt(await ask(rli, "Fixed deposit amount: ")),
-        logger
-      ),
-    (a) => PoolAPI.join(providers, a, logger)
-  );
-  if (!api) return;
-  while (true) {
-    const choice = await ask(rli, POOL_QUESTION);
-    try {
-      switch (choice) {
-        case "1":
-          show(logger, "Pool state", await Rx.firstValueFrom(api.state));
-          break;
-        case "2": {
-          const { noteJson } = await api.deposit();
-          logger.info(`NOTE (save this, it controls the funds): ${noteJson}`);
-          await afterTx(wallet, logger, "deposit");
-          break;
-        }
-        case "3":
-          await api.withdraw(
-            await ask(rli, "Recipient coin public key (32-byte hex): ")
-          );
-          await afterTx(wallet, logger, "withdraw");
-          break;
-        case "4":
-          await api.loadNote(await ask(rli, "Note JSON: "));
-          logger.info("Note imported and set active");
-          break;
-        case "5":
-          logger.info(`Active note: ${await api.activeNoteJson()}`);
-          break;
-        case "6":
-          return;
-        default:
-          logger.error(`Invalid choice: ${choice}`);
-      }
-    } catch (e) {
-      logger.error(`Action failed: ${e instanceof Error ? e.message : e}`);
-    }
+  if (!config.networkId.toLowerCase().includes("preview")) {
+    logger.warn(
+      `BLOCKFROST_PROJECT_ID is set but networkId is '${config.networkId}', not preview. Ignoring it.`,
+    );
+    return config;
   }
+
+  const query = `?project_id=${encodeURIComponent(projectId)}`;
+  logger.info("Using Blockfrost Preview endpoints");
+  return {
+    ...config,
+    node: `https://rpc.midnight-preview.blockfrost.io/${query}`,
+    indexer: `https://midnight-preview.blockfrost.io/api/v0${query}`,
+    indexerWS: `wss://midnight-preview.blockfrost.io/api/v0/ws${query}`,
+  };
 };
 
-// ─── HTLC ────────────────────────────────────────────────────────────────────
+// ─── wallet (wallet SDK 2) ───────────────────────────────────────────────────
 
-const HTLC_QUESTION = `
+interface WalletContext {
+  wallet: WalletFacade;
+  unshieldedKeystore: ReturnType<typeof createKeystore>;
+  networkId: string;
+}
+
+export const buildWallet = async (
+  config: Config,
+  seedHex: string,
+): Promise<WalletContext> => {
+  const seeds = WalletSeeds.fromMasterSeed(Buffer.from(seedHex, "hex"));
+
+  // SDK 2.x: createKeystore takes { kind, secret }
+  const unshieldedKeystore = createKeystore(
+    { kind: "schnorr", secret: seeds.unshielded },
+    config.networkId,
+  );
+
+  const indexerClientConnection = {
+    indexerHttpUrl: config.indexer,
+    indexerWsUrl: config.indexerWS,
+  };
+  const shieldedConfig = {
+    networkId: config.networkId,
+    indexerClientConnection,
+    provingServerUrl: new URL(config.proofServer),
+    relayURL: new URL(config.node.replace(/^http/, "ws")),
+  };
+  const unshieldedConfig = {
+    networkId: config.networkId,
+    indexerClientConnection,
+    txHistoryStorage: new NoOpTransactionHistoryStorage(),
+  };
+  const dustConfig = {
+    ...shieldedConfig,
+    costParameters: {
+      additionalFeeOverhead: 300_000_000_000_000n,
+      feeBlocksMargin: 5,
+    },
+  };
+
+  const wallet = await WalletFacade.init({
+    configuration: { ...shieldedConfig, ...unshieldedConfig, ...dustConfig },
+    shielded: (cfg: any) => ShieldedWallet(cfg).startWithSeed(seeds.shielded),
+    unshielded: (cfg: any) =>
+      UnshieldedWallet(cfg).startWithPublicKey(
+        PublicKey.fromKeyStore(unshieldedKeystore),
+      ),
+    dust: (cfg: any) => DustWallet(cfg).startWithSeed(seeds.dust),
+  });
+  // If this errors because the wallets are already started, delete this line.
+  await wallet.start(seeds);
+  return { wallet, unshieldedKeystore, networkId: config.networkId };
+};
+
+/** Make sure the wallet has tNIGHT, has registered it, and holds some DUST. */
+export const ensureFunded = async (ctx: WalletContext, logger: Logger) => {
+  const { wallet, unshieldedKeystore } = ctx;
+  const address = String(unshieldedKeystore.getBech32Address());
+  logger.info(`Unshielded address (send tNIGHT here): ${address}`);
+
+  logger.info("Syncing wallet (this can take a few minutes)...");
+  let state = await wallet.waitForSyncedState();
+
+  const dustNow = () => state.dust.balance(new Date());
+  if (dustNow() > 0n) {
+    logger.info(`DUST balance: ${formatDust(dustNow())}`);
+    return;
+  }
+
+  const night = () =>
+    state.unshielded.balances[ledger.unshieldedToken().raw] ?? 0n;
+  if (night() === 0n) {
+    logger.info(
+      "No tNIGHT yet. Request some from the faucet for the address above...",
+    );
+    await Rx.firstValueFrom(
+      wallet.state().pipe(
+        Rx.throttleTime(10_000),
+        Rx.filter(
+          (s) =>
+            (s.unshielded.balances[ledger.unshieldedToken().raw] ?? 0n) > 0n,
+        ),
+      ),
+    );
+    state = await wallet.waitForSyncedState();
+  }
+  logger.info(`tNIGHT balance: ${formatNight(night())}`);
+
+  const unregistered = state.unshielded.availableCoins.filter(
+    (c: any) => c.meta?.registeredForDustGeneration !== true,
+  );
+  // Debug: shows the real coin metadata so the registered-flag name can be verified.
+  if (unregistered[0]) show(logger, "first unregistered coin", unregistered[0]);
+  if (unregistered.length > 0) {
+    logger.info("Registering tNIGHT for DUST generation...");
+    const target = String(
+      DustAddress.encodePublicKey(ctx.networkId, state.dust.publicKey),
+    );
+    const dustReceiver = MidnightBech32m.parse(target).decode(
+      DustAddress,
+      ctx.networkId,
+    );
+    const { fee } = await wallet.estimateRegistration(unregistered);
+    await wallet.waitForGeneratedDust(unregistered, fee);
+    const recipe = await wallet.registerNightUtxosForDustGeneration(
+      unregistered,
+      unshieldedKeystore.getPublicKey(),
+      // SignSegment must return a Promise
+      async (payload: Uint8Array) => unshieldedKeystore.signData(payload),
+      dustReceiver,
+    );
+    await wallet.submitTransaction(await wallet.finalizeRecipe(recipe));
+  }
+
+  logger.info("Waiting for DUST to accrue...");
+  await Rx.firstValueFrom(
+    wallet.state().pipe(
+      Rx.throttleTime(5_000),
+      Rx.filter((s) => s.isSynced && s.dust.balance(new Date()) > 0n),
+    ),
+  );
+  state = await Rx.firstValueFrom(wallet.state());
+  logger.info(`DUST balance: ${formatDust(dustNow())}`);
+};
+
+// ─── providers (midnight-js 5) ───────────────────────────────────────────────
+
+// If balance/submit fails at runtime with a version / foreign-handle error,
+// try ProtocolVersion.V9NativeForkVersion instead.
+const V9 = ProtocolVersion.MaxSupportedVersion;
+
+const makeProviders = async (
+  config: Config,
+  ctx: WalletContext,
+): Promise<HtlcProviders> => {
+  const { wallet } = ctx;
+  const state = await Rx.firstValueFrom(
+    wallet.state().pipe(Rx.filter((s) => s.isSynced)),
+  );
+
+  const walletProvider = createLedger9WalletProvider({
+    balanceTx: async (tx, ttl) => {
+      const unbound = WalletTransaction.adopt(
+        "Unbound",
+        tx.deserialize({ v9: ledger.Transaction }),
+        V9,
+      );
+      const recipe = await wallet.balanceUnboundTransaction(unbound as any, {
+        ttl: ttl ?? new Date(Date.now() + 30 * 60_000),
+      });
+      return wallet.finalizeRecipe(recipe as any) as any;
+    },
+    getCoinPublicKey: () => state.shielded.coinPublicKey.toHexString(),
+    getEncryptionPublicKey: () =>
+      state.shielded.encryptionPublicKey.toHexString(),
+  });
+
+  const midnightProvider = createLedger9MidnightProvider(async (tx) => {
+    const finalized = WalletTransaction.adopt(
+      "Finalized",
+      tx.deserialize({ v9: ledger.Transaction }),
+      V9,
+    );
+    return (await wallet.submitTransaction(finalized as any)) as any;
+  });
+
+  const password = process.env.PRIVATE_STATE_PASSWORD ?? "";
+  if (password.length < 16) {
+    throw new Error(
+      "Set PRIVATE_STATE_PASSWORD (16+ characters) in .env: it encrypts the private-state store.",
+    );
+  }
+
+  const zkConfigProvider = new NodeZkConfigProvider<string>(
+    config.zkConfigPath,
+  );
+
+  return {
+    privateStateProvider: levelPrivateStateProvider<string>({
+      privateStateStoreName: config.privateStateStoreName,
+      accountId: walletProvider.getCoinPublicKey(),
+      privateStoragePasswordProvider: async () => password,
+    }),
+    publicDataProvider: indexerPublicDataProvider(
+      config.indexer,
+      config.indexerWS,
+    ),
+    zkConfigProvider,
+    // TODO(verify): httpClientProofProvider takes an options object in v5; check the
+    // HttpClientProofProviderOptions type for the exact field names.
+    proofProvider: httpClientProofProvider({
+      url: config.proofServer,
+      zkConfigProvider,
+    } as any),
+    walletProvider,
+    midnightProvider,
+    config: { networkId: config.networkId, ttlSeconds: 600 },
+  } as unknown as HtlcProviders;
+};
+
+// ─── HTLC menu ───────────────────────────────────────────────────────────────
+
+const DEPLOY_OR_JOIN = `
+You can do one of the following:
+  1. Deploy a new HTLC contract
+  2. Join an existing one
+  3. Exit
+Choose: `;
+
+const HTLC_MENU = `
 HTLC swap leg:
-  1. Show locks
+  1. Show state
   2. Generate a new secret + hashlock
   3. Lock funds
   4. Claim with secret
   5. Refund after expiry
-  6. Back
+  6. Show wallet balances
+  7. Exit
 
 Which would you like to do? `;
 
 const htlcLoop = async (
-  wallet: Wallet & Resource,
+  ctx: WalletContext,
   providers: HtlcProviders,
+  config: Config,
   rli: Interface,
-  logger: Logger
+  logger: Logger,
 ) => {
-  const api = await resolveContract(
-    rli,
-    logger,
-    () => HtlcAPI.deploy(providers, logger),
-    (a) => HtlcAPI.join(providers, a, logger)
+  const compiled = makeHtlcCompiledContract(config.zkConfigPath);
+
+  let api: HtlcAPI | null = null;
+  while (api === null) {
+    const choice = await ask(rli, DEPLOY_OR_JOIN);
+    if (choice === "3") return;
+    try {
+      if (choice === "1") {
+        // TODO(verify): deploy signature (providers, compiledContract, logger)
+        api = await (HtlcAPI as any).deploy(providers, compiled, logger);
+      } else if (choice === "2") {
+        const addr = await ask(rli, "Contract address (hex): ");
+        api = await HtlcAPI.join(providers, compiled, addr, logger);
+      }
+    } catch (e) {
+      logger.error(
+        `Failed: ${e instanceof Error ? (e.stack ?? e.message) : e}`,
+      );
+    }
+  }
+  logger.info(`HTLC contract address: ${api.deployedContractAddress}`);
+  logger.info(
+    "Put this address in packages/frontend/.env as VITE_HTLC_ADDRESS.",
   );
-  if (!api) return;
+
   while (true) {
-    const choice = await ask(rli, HTLC_QUESTION);
+    const choice = await ask(rli, HTLC_MENU);
     try {
       switch (choice) {
         case "1":
@@ -241,22 +368,37 @@ const htlcLoop = async (
         case "3":
           await api.lock({
             amount: BigInt(await ask(rli, "Amount: ")),
+            colorHex: await ask(rli, "Coin color (hex): "),
             hashlockHex: await ask(rli, "Hashlock (hex): "),
-            claimantCoinPublicKeyHex: await ask(rli, "Claimant coin public key (hex): "),
-            refundCoinPublicKeyHex: await ask(rli, "Refund coin public key (hex): "),
+            claimantCoinPublicKeyHex: await ask(
+              rli,
+              "Claimant coin public key (hex): ",
+            ),
+            refundCoinPublicKeyHex: await ask(
+              rli,
+              "Refund coin public key (hex): ",
+            ),
             expiry: BigInt(await ask(rli, "Expiry (unix seconds): ")),
           });
-          await afterTx(wallet, logger, "lock");
+          logger.info("lock submitted");
           break;
         case "4":
           await api.claim(await ask(rli, "Preimage (hex): "));
-          await afterTx(wallet, logger, "claim");
+          logger.info("claim submitted");
           break;
         case "5":
           await api.refund(await ask(rli, "Hashlock (hex): "));
-          await afterTx(wallet, logger, "refund");
+          logger.info("refund submitted");
           break;
-        case "6":
+        case "6": {
+          const s = await Rx.firstValueFrom(ctx.wallet.state());
+          logger.info(`DUST: ${formatDust(s.dust.balance(new Date()))}`);
+          logger.info(
+            `tNIGHT: ${formatNight(s.unshielded.balances[ledger.unshieldedToken().raw] ?? 0n)}`,
+          );
+          break;
+        }
+        case "7":
           return;
         default:
           logger.error(`Invalid choice: ${choice}`);
@@ -267,586 +409,68 @@ const htlcLoop = async (
   }
 };
 
-// ─── Top-level menu ──────────────────────────────────────────────────────────
+// ─── entry point ─────────────────────────────────────────────────────────────
 
-const MAIN_QUESTION = `
-Which contract do you want to use?
-  1. OTC sealed-bid auction
-  2. Private pool (deposit / withdraw)
-  3. HTLC swap
-  4. Show wallet state
-  5. Exit
-
-Choose: `;
-
-const circuit_main_loop = async (
-  wallet: Wallet & Resource,
-  makeProviders: MakeProviders,
-  rli: Interface,
-  logger: Logger
-): Promise<void> => {
-  while (true) {
-    const choice = await ask(rli, MAIN_QUESTION);
-    switch (choice) {
-      case "1":
-        await otcLoop(wallet, makeProviders("otc"), rli, logger);
-        break;
-      case "2":
-        await poolLoop(wallet, makeProviders("pool"), rli, logger);
-        break;
-      case "3":
-        await htlcLoop(wallet, makeProviders("htlc"), rli, logger);
-        break;
-      case "4":
-        await displayComprehensiveWalletState(wallet, undefined, logger);
-        break;
-      case "5":
-        logger.info("Exiting.......");
-        return;
-      default:
-        logger.error(`Invalid choice: ${choice}`);
-    }
-  }
-};
-
-// Re-exported so config.ts and scripts can reference the store names.
-export { OtcPrivateStateId, PoolPrivateStateId, HtlcPrivateStateId };
-
-export const createWalletAndMidnightProvider = async (
-  wallet: Wallet
-): Promise<WalletProvider & MidnightProvider> => {
-  const state = await Rx.firstValueFrom(wallet.state());
-  return {
-    coinPublicKey: state.coinPublicKey,
-    encryptionPublicKey: state.encryptionPublicKey,
-    balanceTx(
-      tx: UnbalancedTransaction,
-      newCoins: CoinInfo[]
-    ): Promise<BalancedTransaction> {
-      return wallet
-        .balanceTransaction(
-          ZswapTransaction.deserialize(
-            tx.serialize(getLedgerNetworkId()),
-            getZswapNetworkId()
-          ),
-          newCoins
-        )
-        .then((tx) => wallet.proveTransaction(tx))
-        .then((zswapTx) =>
-          Transaction.deserialize(
-            zswapTx.serialize(getZswapNetworkId()),
-            getLedgerNetworkId()
-          )
-        )
-        .then(createBalancedTx);
-    },
-    submitTx(tx: BalancedTransaction): Promise<TransactionId> {
-      return wallet.submitTransaction(tx);
-    },
-  };
-};
-
-export const waitForSync = (wallet: Wallet, logger: Logger) =>
-  Rx.firstValueFrom(
-    wallet.state().pipe(
-      Rx.throttleTime(5_000),
-      Rx.tap((state) => {
-        const applyGap = state.syncProgress?.lag.applyGap ?? 0n;
-        const sourceGap = state.syncProgress?.lag.sourceGap ?? 0n;
-        logger.info(
-          `Waiting for funds. Backend lag: ${sourceGap}, wallet lag: ${applyGap}, transactions=${state.transactionHistory.length}`
-        );
-      }),
-      Rx.filter((state) => {
-        // Let's allow progress only if wallet is synced fully
-        return state.syncProgress !== undefined && state.syncProgress.synced;
-      })
-    )
-  );
-
-export const waitForSyncProgress = async (wallet: Wallet, logger: Logger) =>
-  await Rx.firstValueFrom(
-    wallet.state().pipe(
-      Rx.throttleTime(5_000),
-      Rx.tap((state) => {
-        const applyGap = state.syncProgress?.lag.applyGap ?? 0n;
-        const sourceGap = state.syncProgress?.lag.sourceGap ?? 0n;
-        logger.info(
-          `Waiting for funds. Backend lag: ${sourceGap}, wallet lag: ${applyGap}, transactions=${state.transactionHistory.length}`
-        );
-      }),
-      Rx.filter((state) => {
-        // Let's allow progress only if syncProgress is defined
-        return state.syncProgress !== undefined;
-      })
-    )
-  );
-
-export const waitForFunds = (wallet: Wallet, logger: Logger) =>
-  Rx.firstValueFrom(
-    wallet.state().pipe(
-      Rx.throttleTime(10_000),
-      Rx.tap((state) => {
-        const applyGap = state.syncProgress?.lag.applyGap ?? 0n;
-        const sourceGap = state.syncProgress?.lag.sourceGap ?? 0n;
-        logger.info(
-          `Waiting for funds. Backend lag: ${sourceGap}, wallet lag: ${applyGap}, transactions=${state.transactionHistory.length}`
-        );
-      }),
-      Rx.filter((state) => {
-        // Let's allow progress only if wallet is synced
-        return state.syncProgress?.synced === true;
-      }),
-      Rx.map((s) => s.balances[nativeToken()] ?? 0n),
-      Rx.filter((balance) => balance > 0n)
-    )
-  );
-
-export const isAnotherChain = async (
-  wallet: Wallet,
-  offset: number,
-  logger: Logger
-) => {
-  await waitForSyncProgress(wallet, logger);
-  // Here wallet does not expose the offset block it is synced to, that is why this workaround
-  const walletOffset = Number(JSON.parse(await wallet.serializeState()).offset);
-  if (walletOffset < offset - 1) {
-    logger.info(
-      `Your offset offset is: ${walletOffset} restored offset: ${offset} so it is another chain`
-    );
-    return true;
-  } else {
-    logger.info(
-      `Your offset offset is: ${walletOffset} restored offset: ${offset} ok`
-    );
-    return false;
-  }
-};
-
-export const waitForTokenBalance = (
-  wallet: Wallet,
-  tokenType: string,
-  minimumAmount: bigint,
-  logger: Logger,
-  timeoutMs: number = 30000
-): Promise<bigint> =>
-  Rx.firstValueFrom(
-    wallet.state().pipe(
-      Rx.throttleTime(2_000),
-      Rx.tap((state) => {
-        const balance = state.balances[tokenType] ?? 0n;
-        const applyGap = state.syncProgress?.lag.applyGap ?? 0n;
-        const sourceGap = state.syncProgress?.lag.sourceGap ?? 0n;
-        logger.info(
-          `Waiting for ${tokenType} balance. Current: ${balance}, Target: ${minimumAmount}, Backend lag: ${sourceGap}, Wallet lag: ${applyGap}`
-        );
-      }),
-      Rx.filter((state) => {
-        const balance = state.balances[tokenType] ?? 0n;
-        return state.syncProgress?.synced === true && balance >= minimumAmount;
-      }),
-      Rx.map((state) => state.balances[tokenType] ?? 0n),
-      Rx.timeout(timeoutMs)
-    )
-  );
-
-// Enhanced function to wait for wallet sync after operations
-export const waitForWalletSyncAfterOperation = async (
-  wallet: Wallet,
-  logger: Logger,
-  timeoutMs: number = 30000
-): Promise<void> => {
+const checkProofServer = async (url: string) => {
   try {
-    await Rx.firstValueFrom(
-      wallet.state().pipe(
-        Rx.throttleTime(1_000),
-        Rx.tap((state) => {
-          const applyGap = state.syncProgress?.lag.applyGap ?? 0n;
-          const sourceGap = state.syncProgress?.lag.sourceGap ?? 0n;
-          logger.info(
-            `Syncing after operation. Backend lag: ${sourceGap}, Wallet lag: ${applyGap}`
-          );
-        }),
-        Rx.filter((state) => {
-          return state.syncProgress?.synced === true;
-        }),
-        Rx.timeout(timeoutMs)
-      )
-    );
-    logger.info("Wallet sync completed after operation");
-  } catch (error) {
-    logger.warn(`Wallet sync timeout after ${timeoutMs}ms`);
-  }
-};
-
-// Function to display comprehensive wallet state including all token types
-const displayComprehensiveWalletState = async (
-  wallet: Wallet,
-  currentContractState: unknown,
-  logger: Logger
-): Promise<void> => {
-  const state = await Rx.firstValueFrom(wallet.state());
-
-  logger.info("=== WALLET STATE ===");
-  logger.info(`Address: ${state.address}`);
-  logger.info(
-    `Sync Status: ${state.syncProgress?.synced ? "SYNCED" : "SYNCING"}`
-  );
-
-  if (state.syncProgress) {
-    logger.info(`Apply Gap: ${state.syncProgress.lag.applyGap}`);
-    logger.info(`Source Gap: ${state.syncProgress.lag.sourceGap}`);
-  }
-
-  logger.info("=== TOKEN BALANCES ===");
-  Object.entries(state.balances).forEach(([tokenType, balance]) => {
-    if (tokenType === nativeToken()) {
-      logger.info(`Native Token (tDUST): ${balance}`);
-    } else {
-      logger.info(`Token ${tokenType}: ${balance}`);
-    }
-  });
-
-  logger.info(`Transaction History Count: ${state.transactionHistory.length}`);
-  logger.info("===================");
-};
-
-export const buildEnhancedWalletAndWaitForFunds = async (
-  config: Config,
-  seed: string,
-  filename: string,
-  logger: Logger
-): Promise<Wallet & Resource> => {
-  // ... (keep existing wallet building logic)
-  const wallet = await buildWalletAndWaitForFunds(
-    config,
-    seed,
-    filename,
-    logger
-  );
-
-  // Set up continuous state monitoring
-  const stateSubscription = wallet
-    .state()
-    .pipe(Rx.throttleTime(60_000))
-    .subscribe({
-      next: (state) => {
-        logger.info("Wallet state changed - balances updated");
-        Object.entries(state.balances).forEach(([tokenType, balance]) => {
-          if (balance > 0n) {
-            logger.info(`${tokenType}: ${balance}`);
-          }
-        });
-      },
-    });
-
-  // Store subscription reference for cleanup
-  (wallet as any).__stateSubscription = stateSubscription;
-
-  return wallet;
-};
-
-export const buildWalletAndWaitForFunds = async (
-  { indexer, indexerWS, node, proofServer }: Config,
-  seed: string,
-  filename: string,
-  logger: Logger
-): Promise<Wallet & Resource> => {
-  const directoryPath = process.env.SYNC_CACHE;
-  let wallet: Wallet & Resource;
-  if (directoryPath !== undefined) {
-    if (fs.existsSync(`${directoryPath}/${filename}`)) {
-      logger.info(
-        `Attempting to restore state from ${directoryPath}/${filename}`
-      );
-      try {
-        const serializedStream = fs.createReadStream(
-          `${directoryPath}/${filename}`,
-          "utf-8"
-        );
-        const serialized = await streamToString(serializedStream);
-        serializedStream.on("finish", () => {
-          serializedStream.close();
-        });
-        wallet = await WalletBuilder.restore(
-          indexer,
-          indexerWS,
-          proofServer,
-          node,
-          seed,
-          serialized,
-          "info"
-        );
-        wallet.start();
-        const stateObject = JSON.parse(serialized);
-        if (
-          (await isAnotherChain(wallet, Number(stateObject.offset), logger)) ===
-          true
-        ) {
-          logger.warn("The chain was reset, building wallet from scratch");
-          wallet = await WalletBuilder.build(
-            indexer,
-            indexerWS,
-            proofServer,
-            node,
-            seed,
-            getZswapNetworkId(),
-            "info"
-          );
-          wallet.start();
-        } else {
-          const newState = await waitForSync(wallet, logger);
-          // allow for situations when there's no new index in the network between runs
-          if (newState.syncProgress?.synced) {
-            logger.info("Wallet was able to sync from restored state");
-          } else {
-            logger.info(`Offset: ${stateObject.offset}`);
-            logger.info(
-              `SyncProgress.lag.applyGap: ${newState.syncProgress?.lag.applyGap}`
-            );
-            logger.info(
-              `SyncProgress.lag.sourceGap: ${newState.syncProgress?.lag.sourceGap}`
-            );
-            logger.warn(
-              "Wallet was not able to sync from restored state, building wallet from scratch"
-            );
-            wallet = await WalletBuilder.build(
-              indexer,
-              indexerWS,
-              proofServer,
-              node,
-              seed,
-              getZswapNetworkId(),
-              "info"
-            );
-            wallet.start();
-          }
-        }
-      } catch (error: unknown) {
-        if (typeof error === "string") {
-          logger.error(error);
-        } else if (error instanceof Error) {
-          logger.error(error.message);
-        } else {
-          logger.error(error);
-        }
-        logger.warn(
-          "Wallet was not able to restore using the stored state, building wallet from scratch"
-        );
-        wallet = await WalletBuilder.build(
-          indexer,
-          indexerWS,
-          proofServer,
-          node,
-          seed,
-          getZswapNetworkId(),
-          "info"
-        );
-        wallet.start();
-      }
-    } else {
-      logger.info("Wallet save file not found, building wallet from scratch");
-      wallet = await WalletBuilder.build(
-        indexer,
-        indexerWS,
-        proofServer,
-        node,
-        seed,
-        getZswapNetworkId(),
-        "info"
-      );
-      wallet.start();
-    }
-  } else {
-    logger.info(
-      "File path for save file not found, building wallet from scratch"
-    );
-    wallet = await WalletBuilder.build(
-      indexer,
-      indexerWS,
-      proofServer,
-      node,
-      seed,
-      getZswapNetworkId(),
-      "info"
-    );
-    wallet.start();
-  }
-
-  const state = await Rx.firstValueFrom(wallet.state());
-  logger.info(`Your wallet seed is: ${seed}`);
-  logger.info(`Your wallet address is: ${state.address}`);
-  let balance = state.balances[nativeToken()];
-  if (balance === undefined || balance === 0n) {
-    logger.info(`Your wallet balance is: 0`);
-    logger.info(`Waiting to receive tokens...`);
-    balance = await waitForFunds(wallet, logger);
-  }
-  logger.info(`Your wallet balance is: ${balance}`);
-  return wallet;
-};
-
-export const randomBytes = (length: number): Uint8Array => {
-  const bytes = new Uint8Array(length);
-  webcrypto.getRandomValues(bytes);
-  return bytes;
-};
-
-// Generate a random see and create the wallet with that.
-export const buildFreshWallet = async (
-  config: Config,
-  logger: Logger
-): Promise<Wallet & Resource> =>
-  await buildWalletAndWaitForFunds(config, toHex(randomBytes(32)), "", logger);
-
-// Prompt for a seed and create the wallet with that.
-const buildWalletFromSeed = async (
-  config: Config,
-  rli: Interface,
-  logger: Logger
-): Promise<Wallet & Resource> => {
-  const seed = await rli.question("Enter your wallet seed: ");
-  return await buildWalletAndWaitForFunds(config, seed, "", logger);
-};
-
-/* ***********************************************************************
- * This seed gives access to tokens minted in the genesis block of a local development node - only
- * used in standalone networks to build a wallet with initial funds.
- */
-const GENESIS_MINT_WALLET_SEED =
-  "0000000000000000000000000000000000000000000000000000000000000001";
-
-const WALLET_LOOP_QUESTION = `
-You can do one of the following:
-  1. Build a fresh wallet
-  2. Build wallet from a seed
-  3. Exit
-Which would you like to do? `;
-
-const buildWallet = async (
-  config: Config,
-  rli: Interface,
-  logger: Logger
-): Promise<(Wallet & Resource) | null> => {
-  if (config instanceof StandaloneConfig) {
-    return await buildWalletAndWaitForFunds(
-      config,
-      GENESIS_MINT_WALLET_SEED,
-      "",
-      logger
+    const res = await fetch(`${url}/health`);
+    if (!res.ok) throw new Error(String(res.status));
+  } catch {
+    throw new Error(
+      `Proof server not reachable at ${url}. Start it with:\n  docker run -d --name proof-server -p 127.0.0.1:6300:6300 midnightntwrk/proof-server:9.0.0`,
     );
   }
-
-  const seed = process.env.WALLET_SEED;
-  if (seed !== undefined) {
-    logger.info(`Using seed from environment variable: ${seed}`);
-    return await buildWalletAndWaitForFunds(config, seed, "", logger);
-  }
-  while (true) {
-    const choice = await rli.question(WALLET_LOOP_QUESTION);
-    switch (choice) {
-      case "1":
-        return await buildFreshWallet(config, logger);
-      case "2":
-        return await buildWalletFromSeed(config, rli, logger);
-      case "3":
-        logger.info("Exiting...");
-        return null;
-      default:
-        logger.error(`Invalid choice: ${choice}`);
-    }
-  }
 };
 
-const mapContainerPort = (
-  env: StartedDockerComposeEnvironment,
-  url: string,
-  containerName: string
-) => {
-  const mappedUrl = new URL(url);
-  const container = env.getContainer(containerName);
-
-  mappedUrl.port = String(container.getFirstMappedPort());
-
-  return mappedUrl.toString().replace(/\/+$/, "");
+const describeCause = (cause: unknown): string => {
+  if (cause instanceof Error) return cause.message;
+  try {
+    return JSON.stringify(cause, (_k, v) =>
+      typeof v === "bigint" ? v.toString() : v,
+    );
+  } catch {
+    return String(cause);
+  }
 };
 
 export const run = async (
-  config: Config,
+  baseConfig: Config,
   logger: Logger,
-  dockerEnv?: DockerComposeEnvironment
 ): Promise<void> => {
+  const config = withBlockfrost(baseConfig, logger);
   const rli = createInterface({ input, output, terminal: true });
-  let env;
-  if (dockerEnv !== undefined) {
-    env = await dockerEnv.up();
-
-    if (config instanceof StandaloneConfig) {
-      config.indexer = mapContainerPort(env, config.indexer, "umbra-otc-indexer");
-      config.indexerWS = mapContainerPort(
-        env,
-        config.indexerWS,
-        "umbra-otc-indexer"
-      );
-      config.node = mapContainerPort(env, config.node, "umbra-otc-node");
-      config.proofServer = mapContainerPort(
-        env,
-        config.proofServer,
-        "umbra-otc-proof-server"
-      );
-    }
-  }
-  const wallet = await buildWallet(config, rli, logger);
+  let ctx: WalletContext | undefined;
+  let failed = false;
   try {
-    if (wallet !== null) {
-      const walletAndMidnightProvider =
-        await createWalletAndMidnightProvider(wallet);
-      // One provider set per contract: each has its own private-state store and ZK key folder.
-      const makeProviders = (name: ContractName) => ({
-        privateStateProvider: levelPrivateStateProvider<string>({
-          privateStateStoreName: `${config.privateStateStoreName}-${name}`,
-        }),
-        publicDataProvider: indexerPublicDataProvider(
-          config.indexer,
-          config.indexerWS
-        ),
-        zkConfigProvider: new NodeZkConfigProvider<never>(
-          path.join(config.zkConfigPath, name)
-        ),
-        proofProvider: httpClientProofProvider(config.proofServer),
-        walletProvider: walletAndMidnightProvider,
-        midnightProvider: walletAndMidnightProvider,
-      });
-      await circuit_main_loop(wallet, makeProviders, rli, logger);
+    const seed = (process.env.WALLET_SEED ?? "").trim();
+    if (!/^[0-9a-fA-F]{64}$/.test(seed)) {
+      throw new Error(
+        "WALLET_SEED must be 64 hex characters. Run `corepack yarn generate-key` in packages/scripts.",
+      );
     }
+    await checkProofServer(config.proofServer);
+    ctx = await buildWallet(config, seed);
+    await ensureFunded(ctx, logger);
+    const providers = await makeProviders(config, ctx);
+    await htlcLoop(ctx, providers, config, rli, logger);
   } catch (e) {
+    failed = true;
     if (e instanceof Error) {
       logger.error(`Found error '${e.message}'`);
-      logger.info("Exiting...");
+      if (e.cause !== undefined)
+        logger.error(`cause: ${describeCause(e.cause)}`);
       logger.debug(`${e.stack}`);
     } else {
       throw e;
     }
   } finally {
+    rli.close();
     try {
-      rli.close();
-      rli.removeAllListeners();
-    } catch (e) {
-    } finally {
-      try {
-        if (wallet !== null) {
-          await wallet.close();
-        }
-      } catch (e) {
-      } finally {
-        try {
-          if (env !== undefined) {
-            await env.down();
-            logger.info("Goodbye");
-            process.exit(0);
-          }
-        } catch (e) {}
-      }
+      await ctx?.wallet.stop();
+    } catch {
+      /* ignore */
     }
+    logger.info("Goodbye");
+    process.exit(failed ? 1 : 0);
   }
 };
