@@ -197,6 +197,13 @@ class MidnightDeployer {
         "Building @umbra-otc/api",
       );
 
+      await this.runCommand(
+        "corepack",
+        ["yarn", "workspace", "@umbra-otc/cli", "build"],
+        this.projectRoot,
+        "Building @umbra-otc/cli",
+      );
+
       // Step 4: the CLI launcher
       const launcher = path.join(this.cliDir, "dist", "launcher", "preview.js");
       if (!fs.existsSync(launcher)) {

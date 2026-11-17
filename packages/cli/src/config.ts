@@ -48,7 +48,6 @@ const logPath = (name: string) =>
  * Midnight Preview endpoints are used instead.
  */
 const blockfrostKey = (process.env.BLOCKFROST_PROJECT_ID ?? "").trim();
-console.log(`Using Blockfrost project id for Preview network: ${blockfrostKey}`);
 const bfQuery = `?project_id=${encodeURIComponent(blockfrostKey)}`;
 const useBlockfrost = blockfrostKey !== "";
 
