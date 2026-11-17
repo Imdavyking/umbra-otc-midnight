@@ -43,26 +43,44 @@ const logPath = (name: string) =>
   );
 
 /**
- * Blockfrost project id for the Preview network (the same endpoints Lace uses).
- * Set BLOCKFROST_PROJECT_ID in the repo-root .env. When it is empty, the official
- * Midnight Preview endpoints are used instead.
+ * Blockfrost (the same endpoints Lace uses) for the Preview network.
+ *
+ *   BLOCKFROST_PROJECT_ID   your project id, in the repo-root .env
+ *   BLOCKFROST_SERVICES     which services go through Blockfrost, comma separated:
+ *                             "node,indexer"  (default when the key is set)
+ *                             "node"          Blockfrost node RPC + official indexer
+ *                             "indexer"       official node RPC + Blockfrost indexer
+ *                             "none"          everything on the official endpoints
+ *
+ * Splitting them lets you find out which service is the one that misbehaves.
  */
 const blockfrostKey = (process.env.BLOCKFROST_PROJECT_ID ?? "").trim();
+const bfServices = new Set(
+  (process.env.BLOCKFROST_SERVICES ?? "node,indexer")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean),
+);
+const bfNode = blockfrostKey !== "" && bfServices.has("node");
+const bfIndexer = blockfrostKey !== "" && bfServices.has("indexer");
 const bfQuery = `?project_id=${encodeURIComponent(blockfrostKey)}`;
-const useBlockfrost = blockfrostKey !== "";
+
+console.log(
+  `[config] preview node: ${bfNode ? "Blockfrost" : "official"}, indexer: ${bfIndexer ? "Blockfrost" : "official"}`,
+);
 
 export class PreviewConfig implements Config {
   networkId = "preview";
   privateStateStoreName = "umbra-otc-htlc";
   logDir = logPath("preview");
   zkConfigPath = zkConfigPath;
-  indexer = useBlockfrost
+  indexer = bfIndexer
     ? `https://midnight-preview.blockfrost.io/api/v0${bfQuery}`
     : "https://indexer.preview.midnight.network/api/v4/graphql";
-  indexerWS = useBlockfrost
+  indexerWS = bfIndexer
     ? `wss://midnight-preview.blockfrost.io/api/v0/ws${bfQuery}`
     : "wss://indexer.preview.midnight.network/api/v4/graphql/ws";
-  node = useBlockfrost
+  node = bfNode
     ? `https://rpc.midnight-preview.blockfrost.io/${bfQuery}`
     : "https://rpc.preview.midnight.network";
   proofServer = "http://127.0.0.1:6300"; // always local

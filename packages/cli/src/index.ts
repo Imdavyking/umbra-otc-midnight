@@ -4,6 +4,8 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { WebSocket } from "ws";
 import dotenv from "dotenv";
 import * as Rx from "rxjs";
+import { installNetTrace, preflight } from "./preflight.js";
+
 import type { Logger } from "pino";
 
 import {
@@ -43,6 +45,8 @@ import { type Config, envPath } from "./config.js";
 
 // The wallet SDK expects a global WebSocket on Node.
 (globalThis as any).WebSocket = WebSocket;
+installNetTrace();
+
 dotenv.config({ path: envPath });
 
 export { HtlcPrivateStateId };
@@ -69,32 +73,6 @@ const formatNight = (raw: bigint) =>
   `${raw / 1_000_000n}.${(raw % 1_000_000n).toString().padStart(6, "0")}`;
 const formatDust = (raw: bigint) =>
   `${raw / 1_000_000_000_000_000n}.${(raw % 1_000_000_000_000_000n).toString().padStart(15, "0")}`;
-
-// ─── Blockfrost endpoints (Preview) ──────────────────────────────────────────
-// Set BLOCKFROST_PROJECT_ID in .env to route the node RPC and the indexer through
-// Blockfrost, the same endpoints Lace uses. Without it, config.ts is used as-is.
-// The key is never logged.
-
-const withBlockfrost = (config: Config, logger: Logger): Config => {
-  const projectId = (process.env.BLOCKFROST_PROJECT_ID ?? "").trim();
-  if (!projectId) return config;
-
-  if (!config.networkId.toLowerCase().includes("preview")) {
-    logger.warn(
-      `BLOCKFROST_PROJECT_ID is set but networkId is '${config.networkId}', not preview. Ignoring it.`,
-    );
-    return config;
-  }
-
-  const query = `?project_id=${encodeURIComponent(projectId)}`;
-  logger.info("Using Blockfrost Preview endpoints");
-  return {
-    ...config,
-    node: `https://rpc.midnight-preview.blockfrost.io/${query}`,
-    indexer: `https://midnight-preview.blockfrost.io/api/v0${query}`,
-    indexerWS: `wss://midnight-preview.blockfrost.io/api/v0/ws${query}`,
-  };
-};
 
 // ─── wallet (wallet SDK 2) ───────────────────────────────────────────────────
 
@@ -162,6 +140,15 @@ export const ensureFunded = async (ctx: WalletContext, logger: Logger) => {
   logger.info("Syncing wallet (this can take a few minutes)...");
   let state = await wallet.waitForSyncedState();
 
+  // BALANCE_ONLY=1 (used by `npm run balance`): print balances and stop, submit nothing.
+  if (process.env.BALANCE_ONLY === "1") {
+    logger.info(
+      `tNIGHT balance: ${formatNight(state.unshielded.balances[ledger.unshieldedToken().raw] ?? 0n)}`,
+    );
+    logger.info(`DUST balance: ${formatDust(state.dust.balance(new Date()))}`);
+    return;
+  }
+
   const dustNow = () => state.dust.balance(new Date());
   if (dustNow() > 0n) {
     logger.info(`DUST balance: ${formatDust(dustNow())}`);
@@ -210,7 +197,13 @@ export const ensureFunded = async (ctx: WalletContext, logger: Logger) => {
       async (payload: Uint8Array) => unshieldedKeystore.signData(payload),
       dustReceiver,
     );
-    await wallet.submitTransaction(await wallet.finalizeRecipe(recipe));
+    try {
+      await wallet.submitTransaction(await wallet.finalizeRecipe(recipe));
+    } catch (e) {
+      // Surface the real reason (e.g. custom error 170/171) before rethrowing.
+      logger.error(`DUST registration submit failed: ${dumpError(e)}`);
+      throw e;
+    }
   }
 
   logger.info("Waiting for DUST to accrue...");
@@ -422,6 +415,19 @@ const checkProofServer = async (url: string) => {
   }
 };
 
+/** Walks the whole .cause chain, since SDK errors hide the real reason deep inside. */
+const dumpError = (e: unknown): string => {
+  const parts: string[] = [];
+  let cur: unknown = e;
+  for (let i = 0; i < 6 && cur !== undefined; i++) {
+    parts.push(
+      cur instanceof Error ? `${cur.name}: ${cur.message}` : describeCause(cur),
+    );
+    cur = cur instanceof Error ? cur.cause : undefined;
+  }
+  return parts.join("  <-  caused by  <-  ");
+};
+
 const describeCause = (cause: unknown): string => {
   if (cause instanceof Error) return cause.message;
   try {
@@ -433,11 +439,7 @@ const describeCause = (cause: unknown): string => {
   }
 };
 
-export const run = async (
-  baseConfig: Config,
-  logger: Logger,
-): Promise<void> => {
-  const config = withBlockfrost(baseConfig, logger);
+export const run = async (config: Config, logger: Logger): Promise<void> => {
   const rli = createInterface({ input, output, terminal: true });
   let ctx: WalletContext | undefined;
   let failed = false;
@@ -449,8 +451,10 @@ export const run = async (
       );
     }
     await checkProofServer(config.proofServer);
+    await preflight(config, logger);
     ctx = await buildWallet(config, seed);
     await ensureFunded(ctx, logger);
+    if (process.env.BALANCE_ONLY === "1") return;
     const providers = await makeProviders(config, ctx);
     await htlcLoop(ctx, providers, config, rli, logger);
   } catch (e) {
