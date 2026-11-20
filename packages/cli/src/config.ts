@@ -74,15 +74,9 @@ export class PreviewConfig implements Config {
   privateStateStoreName = "umbra-otc-htlc";
   logDir = logPath("preview");
   zkConfigPath = zkConfigPath;
-  indexer = bfIndexer
-    ? `https://midnight-preview.blockfrost.io/api/v0${bfQuery}`
-    : "https://indexer.preview.midnight.network/api/v4/graphql";
-  indexerWS = bfIndexer
-    ? `wss://midnight-preview.blockfrost.io/api/v0/ws${bfQuery}`
-    : "wss://indexer.preview.midnight.network/api/v4/graphql/ws";
-  node = bfNode
-    ? `https://rpc.midnight-preview.blockfrost.io/${bfQuery}`
-    : "https://rpc.preview.midnight.network";
+  indexer = "https://indexer.preview.midnight.network/api/v4/graphql";
+  indexerWS = "wss://indexer.preview.midnight.network/api/v4/graphql/ws";
+  node = "https://rpc.preview.midnight.network";
   proofServer = "http://127.0.0.1:6300"; // always local
 }
 

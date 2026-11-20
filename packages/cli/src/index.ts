@@ -1,4 +1,6 @@
 import { Buffer } from "node:buffer";
+import fs from "node:fs";
+import path from "node:path";
 import { stdin as input, stdout as output } from "node:process";
 import { createInterface, type Interface } from "node:readline/promises";
 import { WebSocket } from "ws";
@@ -18,17 +20,19 @@ import {
   NoOpTransactionHistoryStorage,
   DustAddress,
   MidnightBech32m,
+  DefaultForkSchedule,
+  ProtocolVersion,
+  WalletTransaction,
 } from "@midnightntwrk/wallet-sdk";
 import { WalletSeeds } from "@midnightntwrk/wallet-sdk-hd";
-import {
-  WalletTransaction,
-  ProtocolVersion,
-} from "@midnightntwrk/wallet-sdk-abstractions";
 import * as ledger from "@midnight-ntwrk/midnight-js-protocol/v9";
 import {
   createLedger9MidnightProvider,
   createLedger9WalletProvider,
+  LedgerTransaction,
 } from "@midnight-ntwrk/midnight-js-types";
+import { deployContract } from "@midnight-ntwrk/midnight-js-contracts";
+import { ttlOneHour } from "@midnight-ntwrk/midnight-js-utils";
 import { levelPrivateStateProvider } from "@midnight-ntwrk/midnight-js-level-private-state-provider";
 import { indexerPublicDataProvider } from "@midnight-ntwrk/midnight-js-indexer-public-data-provider";
 import { NodeZkConfigProvider } from "@midnight-ntwrk/midnight-js-node-zk-config-provider";
@@ -46,6 +50,22 @@ import { type Config, envPath } from "./config.js";
 // The wallet SDK expects a global WebSocket on Node.
 (globalThis as any).WebSocket = WebSocket;
 installNetTrace();
+// Diagnostics: event-loop lag + memory, printed while the wallet syncs.
+{
+  let last = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    const lag = now - last - 1000;
+    last = now;
+    if (lag > 500) console.log(`[diag] event loop blocked ~${lag}ms`);
+  }, 1000).unref();
+  setInterval(() => {
+    const m = process.memoryUsage();
+    console.log(
+      `[diag] rss=${(m.rss / 1e6).toFixed(0)}MB heapUsed=${(m.heapUsed / 1e6).toFixed(0)}MB external=${(m.external / 1e6).toFixed(0)}MB`,
+    );
+  }, 10_000).unref();
+}
 
 dotenv.config({ path: envPath });
 
@@ -112,13 +132,20 @@ export const buildWallet = async (
   const dustConfig = {
     ...shieldedConfig,
     costParameters: {
+      ledgerParams: ledger.LedgerParameters.initialParameters(),
       additionalFeeOverhead: 300_000_000_000_000n,
       feeBlocksMargin: 5,
     },
   };
 
   const wallet = await WalletFacade.init({
-    configuration: { ...shieldedConfig, ...unshieldedConfig, ...dustConfig },
+    configuration: {
+      ...shieldedConfig,
+      ...unshieldedConfig,
+      ...dustConfig,
+      // Skip replaying the Ledger 8 DUST history: first sync on Preview is minutes, not ~70.
+      skipLedgerV8DustHistory: true,
+    },
     shielded: (cfg: any) => ShieldedWallet(cfg).startWithSeed(seeds.shielded),
     unshielded: (cfg: any) =>
       UnshieldedWallet(cfg).startWithPublicKey(
@@ -139,6 +166,7 @@ export const ensureFunded = async (ctx: WalletContext, logger: Logger) => {
 
   logger.info("Syncing wallet (this can take a few minutes)...");
   let state = await wallet.waitForSyncedState();
+  logger.info("Done syncing wallet.");
 
   // BALANCE_ONLY=1 (used by `npm run balance`): print balances and stop, submit nothing.
   if (process.env.BALANCE_ONLY === "1") {
@@ -219,49 +247,77 @@ export const ensureFunded = async (ctx: WalletContext, logger: Logger) => {
 
 // ─── providers (midnight-js 5) ───────────────────────────────────────────────
 
-// If balance/submit fails at runtime with a version / foreign-handle error,
-// try ProtocolVersion.V9NativeForkVersion instead.
-const V9 = ProtocolVersion.MaxSupportedVersion;
+// ─── providers (midnight-js 5) ───────────────────────────────────────────────
 
-const makeProviders = async (
+export const makeProviders = async (
   config: Config,
   ctx: WalletContext,
 ): Promise<HtlcProviders> => {
-  const { wallet } = ctx;
+  const { wallet, unshieldedKeystore } = ctx;
   const state = await Rx.firstValueFrom(
     wallet.state().pipe(Rx.filter((s) => s.isSynced)),
   );
+  // Never hardcode the protocol version: adopt at whatever the chain runs now.
+  const activeVersion = async () =>
+    (await Rx.firstValueFrom(wallet.state())).activeProtocolVersion;
 
   const walletProvider = createLedger9WalletProvider({
-    balanceTx: async (tx, ttl) => {
-      const unbound = WalletTransaction.adopt(
-        "Unbound",
-        tx.deserialize({ v9: ledger.Transaction }),
-        V9,
-      );
-      const recipe = await wallet.balanceUnboundTransaction(unbound as any, {
-        ttl: ttl ?? new Date(Date.now() + 30 * 60_000),
-      });
-      return wallet.finalizeRecipe(recipe as any) as any;
-    },
     getCoinPublicKey: () => state.shielded.coinPublicKey.toHexString(),
     getEncryptionPublicKey: () =>
       state.shielded.encryptionPublicKey.toHexString(),
-  });
+    balanceTx: async (handle: any, ttl: Date = ttlOneHour()) => {
+      if (handle.era !== "v9") {
+        throw new Error(`expected a ledger 9 transaction, got ${handle.era}`);
+      }
+      const tx = ledger.Transaction.deserialize(
+        "signature",
+        "proof",
+        "pre-binding",
+        handle.serialize(),
+      );
+      const active = await activeVersion();
+      const recipe = await wallet.balanceUnboundTransaction(
+        WalletTransaction.adopt("Unbound", tx, active) as any,
+        { ttl },
+      );
+      // Unshielded inputs need signatures, or the node rejects with error 192.
+      const signed = await wallet.signRecipe(
+        recipe as any,
+        (payload: Uint8Array) => unshieldedKeystore.signDataAsync(payload),
+      );
+      const finalized = await wallet.finalizeRecipe(signed as any);
+      const accepted = ProtocolVersion.epochOf(active, DefaultForkSchedule.v9);
+      const unwrapped = WalletTransaction.unwrapWithin<any>(
+        finalized as any,
+        accepted,
+      );
+      if (unwrapped._tag === "Left") throw unwrapped.left;
+      return unwrapped.right;
+    },
+  } as any);
 
-  const midnightProvider = createLedger9MidnightProvider(async (tx) => {
-    const finalized = WalletTransaction.adopt(
-      "Finalized",
-      tx.deserialize({ v9: ledger.Transaction }),
-      V9,
-    );
-    return (await wallet.submitTransaction(finalized as any)) as any;
+  const midnightProvider = createLedger9MidnightProvider(async (tx: any) => {
+    const finalized = LedgerTransaction.isLedgerTransaction(tx)
+      ? ledger.Transaction.deserialize(
+          "signature",
+          "proof",
+          "binding",
+          tx.serialize(),
+        )
+      : tx;
+    return (await wallet.submitTransaction(
+      WalletTransaction.adopt(
+        "Finalized",
+        finalized,
+        await activeVersion(),
+      ) as any,
+    )) as any;
   });
 
   const password = process.env.PRIVATE_STATE_PASSWORD ?? "";
   if (password.length < 16) {
     throw new Error(
-      "Set PRIVATE_STATE_PASSWORD (16+ characters) in .env: it encrypts the private-state store.",
+      "Set PRIVATE_STATE_PASSWORD (16+ characters, mixed types) in .env: it encrypts the private-state store.",
     );
   }
 
@@ -280,15 +336,14 @@ const makeProviders = async (
       config.indexerWS,
     ),
     zkConfigProvider,
-    // TODO(verify): httpClientProofProvider takes an options object in v5; check the
-    // HttpClientProofProviderOptions type for the exact field names.
-    proofProvider: httpClientProofProvider({
-      url: config.proofServer,
+    // midnight-js 5.0.1: positional (url, zkConfigProvider)
+    proofProvider: httpClientProofProvider(
+      config.proofServer,
       zkConfigProvider,
-    } as any),
+    ),
     walletProvider,
     midnightProvider,
-    config: { networkId: config.networkId, ttlSeconds: 600 },
+    config: { networkId: config.networkId, ttlSeconds: 3600 },
   } as unknown as HtlcProviders;
 };
 
@@ -402,6 +457,61 @@ const htlcLoop = async (
   }
 };
 
+// ─── direct deploy ───────────────────────────────────────────────────────────
+
+// EDIT THESE to match htlc.compact: the witnesses' private state, and the
+// constructor arguments if the contract has a constructor with parameters.
+const HTLC_INITIAL_PRIVATE_STATE: any = {};
+const HTLC_CONSTRUCTOR_ARGS: unknown[] = [];
+
+const deployHtlc = async (
+  providers: HtlcProviders,
+  config: Config,
+  logger: Logger,
+) => {
+  const compiled = makeHtlcCompiledContract(config.zkConfigPath);
+  logger.info("Deploying HTLC (proving can take a few minutes)...");
+  const deployed: any = await deployContract(
+    providers as any,
+    {
+      compiledContract: compiled,
+      privateStateId: HtlcPrivateStateId,
+      initialPrivateState: HTLC_INITIAL_PRIVATE_STATE,
+      ...(HTLC_CONSTRUCTOR_ARGS.length ? { args: HTLC_CONSTRUCTOR_ARGS } : {}),
+    } as any,
+  );
+
+  const tx = deployed.deployTxData.public;
+  logger.info(
+    `✔ HTLC deployed at ${tx.contractAddress} (block ${tx.blockHeight})`,
+  );
+
+  const dir = path.resolve(path.dirname(envPath), "deployments");
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${config.networkId}.json`);
+  fs.writeFileSync(
+    file,
+    JSON.stringify(
+      {
+        htlc: {
+          address: tx.contractAddress,
+          txId: tx.txId,
+          txHash: tx.txHash,
+          blockHeight: tx.blockHeight,
+          blockHash: tx.blockHash,
+          deployedAt: new Date().toISOString(),
+        },
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+  logger.info(`Recorded in ${file}`);
+  logger.info(
+    "Put the address in packages/frontend/.env as VITE_HTLC_ADDRESS.",
+  );
+};
+
 // ─── entry point ─────────────────────────────────────────────────────────────
 
 const checkProofServer = async (url: string) => {
@@ -410,7 +520,7 @@ const checkProofServer = async (url: string) => {
     if (!res.ok) throw new Error(String(res.status));
   } catch {
     throw new Error(
-      `Proof server not reachable at ${url}. Start it with:\n  docker run -d --name proof-server -p 127.0.0.1:6300:6300 midnightntwrk/proof-server:9.0.0`,
+      `Proof server not reachable at ${url}. Start it with:\n  docker run -d --name proof-server -p 127.0.0.1:6300:6300 midnightntwrk/proof-server:9.0.2`,
     );
   }
 };
@@ -456,6 +566,13 @@ export const run = async (config: Config, logger: Logger): Promise<void> => {
     await ensureFunded(ctx, logger);
     if (process.env.BALANCE_ONLY === "1") return;
     const providers = await makeProviders(config, ctx);
+    if (
+      process.env.AUTO_DEPLOY === "true" &&
+      (process.env.DEPLOY_MODE ?? "new") === "new"
+    ) {
+      await deployHtlc(providers, config, logger);
+      return;
+    }
     await htlcLoop(ctx, providers, config, rli, logger);
   } catch (e) {
     failed = true;
