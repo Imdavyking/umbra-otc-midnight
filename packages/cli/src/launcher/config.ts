@@ -97,13 +97,15 @@ export function customConfig(): NetworkConfig {
 }
 
 export function getConfig(): NetworkConfig {
-  const network = process.env['MIDNIGHT_NETWORK'] ?? 'preview';
+  const network = process.env["MIDNIGHT_NETWORK"] ?? "local";
   switch (network) {
-    case 'preview':
+    case "local":
+      return LOCAL_CONFIG;
+    case "preview":
       return PREVIEW_CONFIG;
-    case 'preprod':
+    case "preprod":
       return preprodConfig();
-    case 'custom':
+    case "custom":
       return customConfig();
     default:
       throw new Error(

@@ -1,8 +1,13 @@
-
-import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   type CoinPublicKey,
   type EncPublicKey,
@@ -14,13 +19,13 @@ import {
   LedgerParameters,
   unshieldedToken,
   ZswapSecretKeys,
-} from '@midnight-ntwrk/midnight-js-protocol/v9';
+} from "@midnight-ntwrk/midnight-js-protocol/v9";
 import {
   LedgerTransaction,
   type Ledger9WalletProvider,
   type TransactionAnswer,
-} from '@midnight-ntwrk/midnight-js-types';
-import { ttlOneHour } from '@midnight-ntwrk/midnight-js-utils';
+} from "@midnight-ntwrk/midnight-js-types";
+import { ttlOneHour } from "@midnight-ntwrk/midnight-js-utils";
 import {
   DefaultForkSchedule,
   ProtocolVersion,
@@ -35,15 +40,15 @@ import {
   type FacadeState,
   type UnshieldedKeystore,
   type WalletSeeds,
-} from '@midnightntwrk/wallet-sdk';
+} from "@midnightntwrk/wallet-sdk";
 import {
   type DustWalletOptions,
   type EnvironmentConfiguration,
   FluentWalletBuilder,
   logger as testkitLogger,
-} from '@midnight-ntwrk/testkit-js';
-import * as Rx from 'rxjs';
-import type { Logger } from 'pino';
+} from "@midnight-ntwrk/testkit-js";
+import * as Rx from "rxjs";
+import type { Logger } from "pino";
 
 // A proven, not yet bound ledger 9 transaction: what a contract call or deploy
 // hands the wallet to balance.
@@ -53,18 +58,27 @@ type UnboundTransaction = Transaction<SignatureEnabled, Proof, PreBinding>;
  * Midnight.js 5 passes transactions as era-tagged byte handles. Decode a proven
  * one into the ledger 9 transaction the wallet SDK balances.
  */
-export function unboundFromHandle(handle: LedgerTransaction<'Unbound'>): UnboundTransaction {
-  if (handle.era !== 'v9') throw new Error(`expected a ledger 9 transaction, got ${handle.era}`);
-  return Transaction.deserialize('signature', 'proof', 'pre-binding', handle.serialize());
+export function unboundFromHandle(
+  handle: LedgerTransaction<"Unbound">,
+): UnboundTransaction {
+  if (handle.era !== "v9")
+    throw new Error(`expected a ledger 9 transaction, got ${handle.era}`);
+  return Transaction.deserialize(
+    "signature",
+    "proof",
+    "pre-binding",
+    handle.serialize(),
+  );
 }
 
 /** The secret a wallet is built from: a hex seed or a BIP-39 mnemonic. */
-export type WalletSecret = { kind: 'seed'; value: string } | { kind: 'mnemonic'; value: string };
+export type WalletSecret =
+  { kind: "seed"; value: string } | { kind: "mnemonic"; value: string };
 
 // testkit logs through its own module-level logger. At info it prints the
 // wallet's indexer and relay URLs, which carry the Blockfrost project_id, and
 // two lines per sync update. Keep only its warnings and errors.
-testkitLogger.level = 'warn';
+testkitLogger.level = "warn";
 
 export class MidnightWalletProvider implements Ledger9WalletProvider {
   readonly wallet: WalletFacade;
@@ -95,13 +109,13 @@ export class MidnightWalletProvider implements Ledger9WalletProvider {
   // protocol version, and hands back a handle to unwrap. The keys come from the
   // seeds the wallet was started with, so balancing no longer takes them.
   async balanceTx(
-    handle: LedgerTransaction<'Unbound'>,
+    handle: LedgerTransaction<"Unbound">,
     ttl: Date = ttlOneHour(),
   ): Promise<TransactionAnswer> {
     const tx = unboundFromHandle(handle);
     const active = await this.activeProtocolVersion();
     const recipe = await this.wallet.balanceUnboundTransaction(
-      WalletTransaction.adopt('Unbound', tx, active),
+      WalletTransaction.adopt("Unbound", tx, active),
       { ttl },
     );
     // Balancing may add unshielded inputs (e.g. NIGHT spent to fund a
@@ -113,17 +127,30 @@ export class MidnightWalletProvider implements Ledger9WalletProvider {
     );
     const finalized = await this.wallet.finalizeRecipe(signed);
     const accepted = ProtocolVersion.epochOf(active, DefaultForkSchedule.v9);
-    const unwrapped = WalletTransaction.unwrapWithin<FinalizedTransaction>(finalized, accepted);
-    if (unwrapped._tag === 'Left') throw unwrapped.left;
+    const unwrapped = WalletTransaction.unwrapWithin<FinalizedTransaction>(
+      finalized,
+      accepted,
+    );
+    if (unwrapped._tag === "Left") throw unwrapped.left;
     return unwrapped.right;
   }
 
-  async submitTx(tx: LedgerTransaction<'Finalized', 'v9'> | FinalizedTransaction): Promise<string> {
-    const finalized: FinalizedTransaction = LedgerTransaction.isLedgerTransaction(tx)
-      ? Transaction.deserialize('signature', 'proof', 'binding', tx.serialize())
-      : tx;
+  async submitTx(
+    tx: LedgerTransaction<"Finalized", "v9"> | FinalizedTransaction,
+  ): Promise<string> {
+    const finalized: FinalizedTransaction =
+      LedgerTransaction.isLedgerTransaction(tx)
+        ? Transaction.deserialize(
+            "signature",
+            "proof",
+            "binding",
+            tx.serialize(),
+          )
+        : tx;
     const active = await this.activeProtocolVersion();
-    return this.wallet.submitTransaction(WalletTransaction.adopt('Finalized', finalized, active));
+    return this.wallet.submitTransaction(
+      WalletTransaction.adopt("Finalized", finalized, active),
+    );
   }
 
   private async activeProtocolVersion(): Promise<ProtocolVersion.ProtocolVersion> {
@@ -131,7 +158,7 @@ export class MidnightWalletProvider implements Ledger9WalletProvider {
   }
 
   async start(): Promise<void> {
-    this.logger.info('Starting wallet...');
+    this.logger.info("Starting wallet...");
     await this.wallet.start(this.seeds);
   }
 
@@ -154,16 +181,23 @@ export class MidnightWalletProvider implements Ledger9WalletProvider {
       feeBlocksMargin: 5,
     };
 
-    const base = FluentWalletBuilder.forEnvironment(env)
-      .withDustOptions(dustOptions);
+    const base =
+      FluentWalletBuilder.forEnvironment(env).withDustOptions(dustOptions);
     const builder =
-      secret.kind === 'mnemonic'
+      secret.kind === "mnemonic"
         ? base.withMnemonic(secret.value)
         : base.withSeed(secret.value);
 
     const built = await builder.buildWithoutStarting();
     const { seeds, keystore } = built;
-    const wallet = await restoreSavedState(logger, env, builder, dustOptions, built.wallet, seeds.masterSeed);
+    const wallet = await restoreSavedState(
+      logger,
+      env,
+      builder,
+      dustOptions,
+      built.wallet,
+      seeds.masterSeed,
+    );
 
     logger.info(
       `Wallet built from ${secret.kind}; master seed: ${seeds.masterSeed.slice(0, 8)}...`,
@@ -174,11 +208,11 @@ export class MidnightWalletProvider implements Ledger9WalletProvider {
 }
 
 function isProgressStrictlyComplete(progress: unknown): boolean {
-  if (!progress || typeof progress !== 'object') {
+  if (!progress || typeof progress !== "object") {
     return false;
   }
   const candidate = progress as { isStrictlyComplete?: unknown };
-  if (typeof candidate.isStrictlyComplete !== 'function') {
+  if (typeof candidate.isStrictlyComplete !== "function") {
     return false;
   }
   return (candidate.isStrictlyComplete as () => boolean)();
@@ -189,27 +223,34 @@ export async function syncWallet(
   wallet: WalletFacade,
   timeout = 300_000,
 ): Promise<FacadeState> {
-  logger.info('Syncing wallet...');
+  logger.info("Syncing wallet...");
   let emissionCount = 0;
   const state = await Rx.firstValueFrom(
     wallet.state().pipe(
       Rx.tap((state: FacadeState) => {
         emissionCount++;
-       
         const shielded = isProgressStrictlyComplete(state.shielded.progress);
-        const unshielded = isProgressStrictlyComplete(state.unshielded.progress);
+        const unshielded = isProgressStrictlyComplete(
+          state.unshielded.progress,
+        );
         const dust = isProgressStrictlyComplete(state.dust.progress);
         logger.info(
           `Wallet sync [${emissionCount}]: shielded=${shielded}, unshielded=${unshielded}, dust=${dust}`,
         );
         if (!shielded) {
-          logger.debug(`  shielded.progress: ${JSON.stringify(state.shielded.progress)}`);
+          logger.debug(
+            `  shielded.progress: ${JSON.stringify(state.shielded.progress)}`,
+          );
         }
         if (!unshielded) {
-          logger.debug(`  unshielded.progress: ${JSON.stringify(state.unshielded.progress)}`);
+          logger.debug(
+            `  unshielded.progress: ${JSON.stringify(state.unshielded.progress)}`,
+          );
         }
         if (!dust) {
-          logger.debug(`  dust.progress: ${JSON.stringify(state.dust.progress)}`);
+          logger.debug(
+            `  dust.progress: ${JSON.stringify(state.dust.progress)}`,
+          );
         }
       }),
       Rx.filter(
@@ -218,12 +259,17 @@ export async function syncWallet(
           isProgressStrictlyComplete(state.dust.progress) &&
           isProgressStrictlyComplete(state.unshielded.progress),
       ),
-      Rx.tap(() => logger.info(`Wallet sync complete after ${emissionCount} emissions`)),
+      Rx.tap(() =>
+        logger.info(`Wallet sync complete after ${emissionCount} emissions`),
+      ),
       Rx.timeout({
         each: timeout,
         with: () =>
           Rx.throwError(
-            () => new Error(`Wallet sync timeout after ${timeout}ms (${emissionCount} emissions received)`),
+            () =>
+              new Error(
+                `Wallet sync timeout after ${timeout}ms (${emissionCount} emissions received)`,
+              ),
           ),
       }),
       Rx.catchError((err) => {
@@ -247,14 +293,26 @@ export async function syncWallet(
 // it starts from a new genesis each time. MIDNIGHT_WALLET_STATE=off turns this
 // off.
 
-const STATE_DIR = fileURLToPath(new URL('../.wallet-state/', import.meta.url));
+const STATE_DIR = fileURLToPath(new URL("../.wallet-state/", import.meta.url));
 const stateFiles = new WeakMap<WalletFacade, string>();
 
-type SavedWalletState = { version: 1; shielded: string; unshielded: string; dust: string };
+type SavedWalletState = {
+  version: 1;
+  shielded: string;
+  unshielded: string;
+  dust: string;
+};
 
-function stateFileFor(networkId: string, masterSeed: string): string | undefined {
-  if (networkId === 'undeployed' || process.env['MIDNIGHT_WALLET_STATE'] === 'off') return undefined;
-  const id = createHash('sha256').update(masterSeed).digest('hex').slice(0, 16);
+function stateFileFor(
+  networkId: string,
+  masterSeed: string,
+): string | undefined {
+  if (
+    networkId === "undeployed" ||
+    process.env["MIDNIGHT_WALLET_STATE"] === "off"
+  )
+    return undefined;
+  const id = createHash("sha256").update(masterSeed).digest("hex").slice(0, 16);
   return join(STATE_DIR, `${networkId}-${id}.json`);
 }
 
@@ -267,11 +325,16 @@ async function restoreFacade(
   // testkit keeps the builder's wallet configuration private and does not
   // export the function that derives it; reuse it so a restored wallet is
   // configured exactly like a new one.
-  const config = (builder as unknown as { config: Parameters<typeof ShieldedWallet>[0] }).config;
+  const config = (
+    builder as unknown as { config: Parameters<typeof ShieldedWallet>[0] }
+  ).config;
   const shielded = ShieldedWallet(config).restore(saved.shielded);
   const unshielded = UnshieldedWallet({
     ...config,
-    txHistoryStorage: new InMemoryTransactionHistoryStorage(WalletEntrySchema, mergeWalletEntries),
+    txHistoryStorage: new InMemoryTransactionHistoryStorage(
+      WalletEntrySchema,
+      mergeWalletEntries,
+    ),
   } as Parameters<typeof UnshieldedWallet>[0]).restore(saved.unshielded);
   const dust = DustWallet({
     ...config,
@@ -282,7 +345,9 @@ async function restoreFacade(
     },
   } as Parameters<typeof DustWallet>[0]).restore(saved.dust);
   return WalletFacade.init({
-    configuration: config as Parameters<typeof WalletFacade.init>[0]['configuration'],
+    configuration: config as Parameters<
+      typeof WalletFacade.init
+    >[0]["configuration"],
     shielded: () => shielded,
     unshielded: () => unshielded,
     dust: () => dust,
@@ -302,10 +367,16 @@ async function restoreSavedState(
   let wallet = fresh;
   if (file && existsSync(file)) {
     try {
-      wallet = await restoreFacade(builder, dustOptions, JSON.parse(readFileSync(file, 'utf8')) as SavedWalletState);
+      wallet = await restoreFacade(
+        builder,
+        dustOptions,
+        JSON.parse(readFileSync(file, "utf8")) as SavedWalletState,
+      );
       logger.info(`Restored wallet state from ${file}.`);
     } catch (error) {
-      logger.warn(`Could not restore ${file} (${String(error)}); syncing from genesis.`);
+      logger.warn(
+        `Could not restore ${file} (${String(error)}); syncing from genesis.`,
+      );
     }
   }
   if (file) stateFiles.set(wallet, file);
@@ -313,7 +384,10 @@ async function restoreSavedState(
 }
 
 /** Save the wallet's state for the next build of the same wallet (no-op on the local devnet). */
-export async function saveWalletState(logger: Logger, wallet: WalletFacade): Promise<void> {
+export async function saveWalletState(
+  logger: Logger,
+  wallet: WalletFacade,
+): Promise<void> {
   const file = stateFiles.get(wallet);
   if (!file) return;
   const saved: SavedWalletState = {
@@ -334,10 +408,10 @@ export async function saveWalletState(logger: Logger, wallet: WalletFacade): Pro
 
 /** Genesis-funded seeds on the local `undeployed` devnet. */
 export const LOCAL_SEEDS = {
-  ALICE: '0000000000000000000000000000000000000000000000000000000000000001',
-  BOB: '0000000000000000000000000000000000000000000000000000000000000002',
-  CHARLIE: '0000000000000000000000000000000000000000000000000000000000000003',
-  DAVE: '000000000000000000000000000000000000000000000000000000000000000d',
+  ALICE: "0000000000000000000000000000000000000000000000000000000000000001",
+  BOB: "0000000000000000000000000000000000000000000000000000000000000002",
+  CHARLIE: "0000000000000000000000000000000000000000000000000000000000000003",
+  DAVE: "000000000000000000000000000000000000000000000000000000000000000d",
 } as const;
 
 /** The four wallets a remote run is funded with. */
@@ -345,13 +419,13 @@ export type Role = keyof typeof LOCAL_SEEDS;
 
 /** Suite-specific role names and the wallet each one uses. */
 const ROLE_ALIASES: Record<string, Role> = {
-  ALICE: 'ALICE',
-  BOB: 'BOB',
-  CHARLIE: 'CHARLIE',
-  DAVE: 'DAVE',
-  ORGANIZER: 'ALICE',
-  BIDDER_ONE: 'BOB',
-  BIDDER_TWO: 'CHARLIE',
+  ALICE: "ALICE",
+  BOB: "BOB",
+  CHARLIE: "CHARLIE",
+  DAVE: "DAVE",
+  ORGANIZER: "ALICE",
+  BIDDER_ONE: "BOB",
+  BIDDER_TWO: "CHARLIE",
 };
 
 export interface ResolvedWallet {
@@ -361,15 +435,20 @@ export interface ResolvedWallet {
 }
 
 function readSecret(prefix: string): WalletSecret | null {
-  const mnemonic = process.env[`${prefix}_MNEMONIC`]?.trim().replace(/\s+/g, ' ');
+  const mnemonic = process.env[`${prefix}_MNEMONIC`]
+    ?.trim()
+    .replace(/\s+/g, " ");
   const seed = process.env[`${prefix}_SEED`]?.trim();
-  if (mnemonic && seed) throw new Error(`Set only one of ${prefix}_MNEMONIC or ${prefix}_SEED.`);
-  if (mnemonic) return { kind: 'mnemonic', value: mnemonic };
+  if (mnemonic && seed)
+    throw new Error(`Set only one of ${prefix}_MNEMONIC or ${prefix}_SEED.`);
+  if (mnemonic) return { kind: "mnemonic", value: mnemonic };
   if (seed) {
     if (!/^[0-9a-fA-F]+$/.test(seed) || seed.length % 2 !== 0) {
-      throw new Error(`${prefix}_SEED must be a hex string of even length (no 0x prefix).`);
+      throw new Error(
+        `${prefix}_SEED must be a hex string of even length (no 0x prefix).`,
+      );
     }
-    return { kind: 'seed', value: seed };
+    return { kind: "seed", value: seed };
   }
   return null;
 }
@@ -381,14 +460,24 @@ function readSecret(prefix: string): WalletSecret | null {
  * ORGANIZER) is looked up under its own name first, then under the wallet it
  * maps to.
  */
-export function resolveWallet(network: string, role = 'ALICE'): ResolvedWallet {
+export function resolveWallet(network: string, role = "ALICE"): ResolvedWallet {
   const canonical = ROLE_ALIASES[role.toUpperCase()];
   if (!canonical) {
-    throw new Error(`Unknown wallet role '${role}'. Known roles: ${Object.keys(ROLE_ALIASES).join(', ')}.`);
+    throw new Error(
+      `Unknown wallet role '${role}'. Known roles: ${Object.keys(ROLE_ALIASES).join(", ")}.`,
+    );
   }
+  if (network === "local")
+    return {
+      secret: { kind: "seed", value: LOCAL_SEEDS[canonical] },
+      role: canonical,
+    };
 
   const upper = network.toUpperCase();
-  const prefixes = [`MIDNIGHT_${upper}_${role.toUpperCase()}`, `MIDNIGHT_${upper}_${canonical}`];
+  const prefixes = [
+    `MIDNIGHT_${upper}_${role.toUpperCase()}`,
+    `MIDNIGHT_${upper}_${canonical}`,
+  ];
   for (const prefix of new Set(prefixes)) {
     const secret = readSecret(prefix);
     if (secret) return { secret, role: canonical };
@@ -413,22 +502,30 @@ export function resolveWallet(network: string, role = 'ALICE'): ResolvedWallet {
 // NIGHT has arrived. The DUST wait below is the readiness check instead.
 
 /** How long to wait for a human to visit the faucet, and for DUST to accrue. */
-const FUND_TIMEOUT_MS = Number(process.env['MIDNIGHT_FUND_TIMEOUT_MS'] ?? 30 * 60_000);
+const FUND_TIMEOUT_MS = Number(
+  process.env["MIDNIGHT_FUND_TIMEOUT_MS"] ?? 30 * 60_000,
+);
 
-const hasNight = (s: FacadeState) => Object.values(s.unshielded.balances).some((v) => v > 0n);
+const hasNight = (s: FacadeState) =>
+  Object.values(s.unshielded.balances).some((v) => v > 0n);
 
 /** The indexer's latest block time, or undefined while it can't be read. */
-async function latestBlockTime(indexerHttpUrl: string, timeoutMs: number): Promise<Date | undefined> {
+async function latestBlockTime(
+  indexerHttpUrl: string,
+  timeoutMs: number,
+): Promise<Date | undefined> {
   try {
     const res = await fetch(indexerHttpUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ query: '{ block { timestamp } }' }),
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ query: "{ block { timestamp } }" }),
       signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
     });
-    const body = (await res.json()) as { data?: { block?: { timestamp?: number } } };
+    const body = (await res.json()) as {
+      data?: { block?: { timestamp?: number } };
+    };
     const ts = body.data?.block?.timestamp;
-    return typeof ts === 'number' ? new Date(ts) : undefined;
+    return typeof ts === "number" ? new Date(ts) : undefined;
   } catch {
     return undefined;
   }
@@ -441,12 +538,12 @@ const SPECKS_PER_DUST = 10n ** 15n;
  * The DUST a wallet must hold before a suite transacts: enough to pay for a
  * deploy. MIDNIGHT_MIN_DUST overrides it, in DUST (default 60).
  */
-const MIN_DUST_SPECKS = BigInt(
-  Math.round(Number(process.env['MIDNIGHT_MIN_DUST'] ?? '60') * 1e6),
-) * (SPECKS_PER_DUST / 10n ** 6n);
+const MIN_DUST_SPECKS =
+  BigInt(Math.round(Number(process.env["MIDNIGHT_MIN_DUST"] ?? "60") * 1e6)) *
+  (SPECKS_PER_DUST / 10n ** 6n);
 
 function formatDust(specks: bigint): string {
-  return `${specks / SPECKS_PER_DUST}.${(specks % SPECKS_PER_DUST).toString().padStart(15, '0').slice(0, 6)}`;
+  return `${specks / SPECKS_PER_DUST}.${(specks % SPECKS_PER_DUST).toString().padStart(15, "0").slice(0, 6)}`;
 }
 
 /**
@@ -467,23 +564,33 @@ export async function waitForDust(
   indexerHttpUrl?: string,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
-  logger.info(`Waiting for >=${minCoins} spendable DUST coin(s) (timeout ${timeoutMs}ms)...`);
+  logger.info(
+    `Waiting for >=${minCoins} spendable DUST coin(s) (timeout ${timeoutMs}ms)...`,
+  );
   const state = await Rx.firstValueFrom(
     wallet.state().pipe(
       Rx.filter((s: FacadeState) => s.dust.availableCoins.length >= minCoins),
       Rx.take(1),
       Rx.timeout({
         each: timeoutMs,
-        with: () => Rx.throwError(() => new Error(`No spendable DUST coin within ${timeoutMs}ms`)),
+        with: () =>
+          Rx.throwError(
+            () => new Error(`No spendable DUST coin within ${timeoutMs}ms`),
+          ),
       }),
     ),
   );
   if (indexerHttpUrl) {
-    logger.info(`Waiting for >=${formatDust(MIN_DUST_SPECKS)} DUST at the latest block...`);
+    logger.info(
+      `Waiting for >=${formatDust(MIN_DUST_SPECKS)} DUST at the latest block...`,
+    );
     let latest = state;
     let lastLogged = 0;
     for (;;) {
-      const blockTime = await latestBlockTime(indexerHttpUrl, Math.min(10_000, deadline - Date.now()));
+      const blockTime = await latestBlockTime(
+        indexerHttpUrl,
+        Math.min(10_000, deadline - Date.now()),
+      );
       const balance = blockTime ? latest.dust.balance(blockTime) : 0n;
       if (balance >= MIN_DUST_SPECKS) break;
       if (Date.now() > deadline) {
@@ -492,14 +599,16 @@ export async function waitForDust(
         );
       }
       if (Date.now() - lastLogged >= 60_000) {
-        logger.info(`  DUST ${formatDust(balance)} / ${formatDust(MIN_DUST_SPECKS)}`);
+        logger.info(
+          `  DUST ${formatDust(balance)} / ${formatDust(MIN_DUST_SPECKS)}`,
+        );
         lastLogged = Date.now();
       }
       await new Promise((r) => setTimeout(r, 5_000));
       latest = await Rx.firstValueFrom(wallet.state());
     }
   }
-  logger.info('DUST ready.');
+  logger.info("DUST ready.");
 }
 
 export interface FundingGateOptions {
@@ -522,7 +631,7 @@ export async function waitForNightThenDust(
   keystore: UnshieldedKeystore,
   envConfig: EnvironmentConfiguration,
   faucet: string,
-  { registerDust = true, label = 'wallet' }: FundingGateOptions = {},
+  { registerDust = true, label = "wallet" }: FundingGateOptions = {},
 ): Promise<void> {
   const address = String(keystore.getBech32Address());
   // Bounded peek: if state() hasn't emitted yet, assume "not funded" and fall
@@ -534,39 +643,55 @@ export async function waitForNightThenDust(
     ),
   );
   if (current === null || !hasNight(current)) {
-    logger.info(`Fund ${label} with tNIGHT at ${faucet}; the run continues once it arrives.`);
+    logger.info(
+      `Fund ${label} with tNIGHT at ${faucet}; the run continues once it arrives.`,
+    );
     logger.info(`  address: ${address}`);
-    if (!registerDust) logger.info('  This wallet must NOT have DUST delegated: send tNIGHT only.');
+    if (!registerDust)
+      logger.info(
+        "  This wallet must NOT have DUST delegated: send tNIGHT only.",
+      );
     await Rx.firstValueFrom(
       wallet.state().pipe(
         Rx.filter(hasNight),
         Rx.take(1),
         Rx.timeout({
           each: FUND_TIMEOUT_MS,
-          with: () => Rx.throwError(() => new Error(`No NIGHT at ${address} within ${FUND_TIMEOUT_MS}ms`)),
+          with: () =>
+            Rx.throwError(
+              () =>
+                new Error(`No NIGHT at ${address} within ${FUND_TIMEOUT_MS}ms`),
+            ),
         }),
       ),
     );
   }
 
   if (!registerDust) {
-    logger.info(`${label}: NIGHT present; not registering it for DUST, by design.`);
+    logger.info(
+      `${label}: NIGHT present; not registering it for DUST, by design.`,
+    );
     return;
   }
 
   const state = await Rx.firstValueFrom(wallet.state());
   const night = unshieldedToken().raw;
   const unregistered = state.unshielded.availableCoins.filter(
-    (coin) => coin.utxo.type === night && !coin.meta.registeredForDustGeneration,
+    (coin) =>
+      coin.utxo.type === night && !coin.meta.registeredForDustGeneration,
   );
   if (state.dust.balance(new Date()) === 0n && unregistered.length > 0) {
-    logger.info(`${label}: registering ${unregistered.length} NIGHT UTXO(s) for DUST generation...`);
+    logger.info(
+      `${label}: registering ${unregistered.length} NIGHT UTXO(s) for DUST generation...`,
+    );
     const recipe = await wallet.registerNightUtxosForDustGeneration(
       unregistered,
       keystore.getPublicKey(),
       (payload) => keystore.signDataAsync(payload),
     );
-    const txId = await wallet.submitTransaction(await wallet.finalizeRecipe(recipe));
+    const txId = await wallet.submitTransaction(
+      await wallet.finalizeRecipe(recipe),
+    );
     logger.info(`${label}: DUST registration submitted (${txId}).`);
   }
   await waitForDust(logger, wallet, 1, FUND_TIMEOUT_MS, envConfig.indexer);
