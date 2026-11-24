@@ -195,6 +195,7 @@ export async function syncWallet(
     wallet.state().pipe(
       Rx.tap((state: FacadeState) => {
         emissionCount++;
+       
         const shielded = isProgressStrictlyComplete(state.shielded.progress);
         const unshielded = isProgressStrictlyComplete(state.unshielded.progress);
         const dust = isProgressStrictlyComplete(state.dust.progress);
