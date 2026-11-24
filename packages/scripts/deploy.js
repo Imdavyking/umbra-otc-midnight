@@ -8,6 +8,11 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Load <root>/.env (WALLET_SEED etc.) so the launcher inherits it
+try {
+  process.loadEnvFile(path.resolve(__dirname, "..", "..", ".env"));
+} catch {}
+
 const COMPACT_TOOLCHAIN = "+0.36.1"; // Compact 0.36.x → language 0.28, runtime 0.21 (ledger 9)
 const MIN_NODE = [22, 12];
 
@@ -15,18 +20,23 @@ const MIN_NODE = [22, 12];
  * HTLC deploy helper for Midnight (ledger 9):
  *  1. checks the environment (Linux/WSL, Node >= 22.12, `compact` installed)
  *  2. compiles packages/contracts/src/htlc.compact with the Compact CLI
- *  3. verifies the compile output, then builds the contracts and api packages
- *  4. hands over to the CLI launcher, if the CLI has been built for the ledger 9 stack
+ *  3. verifies the compile output, then builds the contracts, api and cli packages
+ *  4. runs the CLI launcher (packages/cli/dist/launcher/preview.js) to deploy / join
  *
  * Only the HTLC contract is compiled. otc.compact and pool.compact are ignored.
  */
 class MidnightDeployer {
-  constructor(deployMode = "new", { skipCompile = false } = {}) {
+  constructor(
+    deployMode = "new",
+    { skipCompile = false, address = "", network = "preview" } = {},
+  ) {
     this.projectRoot = path.resolve(__dirname, "..", "..");
     this.contractsDir = path.join(this.projectRoot, "packages", "contracts");
     this.cliDir = path.join(this.projectRoot, "packages", "cli");
     this.deployMode = deployMode; // 'new' or 'join'
     this.skipCompile = skipCompile;
+    this.address = address; // contract address for 'join'
+    this.network = network; // local | preview | preprod | custom
   }
 
   /** Run a command and return a promise */
@@ -97,6 +107,15 @@ class MidnightDeployer {
       }
     }
 
+    if (this.deployMode === "join") {
+      const addr = this.address || process.env.HTLC_ADDRESS;
+      if (!addr) {
+        problems.push(
+          "Join mode needs a contract address: --address=<addr> or HTLC_ADDRESS=<addr>.",
+        );
+      }
+    }
+
     return problems;
   }
 
@@ -131,9 +150,10 @@ class MidnightDeployer {
     }
     console.log("2️⃣ corepack yarn workspace @umbra-otc/contract build");
     console.log("3️⃣ corepack yarn workspace @umbra-otc/api build");
+    console.log("   corepack yarn workspace @umbra-otc/cli build");
     console.log("   📁 Working directory:", this.projectRoot, "\n");
     console.log(
-      "4️⃣ npm run preview   (only if packages/cli is built for the ledger 9 stack)",
+      `4️⃣ node dist/launcher/preview.js ${this.deployMode}   (MIDNIGHT_NETWORK=${this.network})`,
     );
     console.log("   📁 Working directory:", this.cliDir, "\n");
     console.log("💡 Run without --dry-run to execute these commands");
@@ -146,7 +166,7 @@ class MidnightDeployer {
         this.deployMode === "join"
           ? "Joining Existing HTLC"
           : "Deploying New HTLC";
-      console.log(`🚀 Starting Midnight ${modeText}...\n`);
+      console.log(`🚀 Starting Midnight ${modeText} on ${this.network}...\n`);
 
       const problems = this.checkPrerequisites();
       if (problems.length > 0) {
@@ -159,7 +179,7 @@ class MidnightDeployer {
       console.log("📋 Steps:");
       console.log("   1. 🔨 Compile htlc.compact");
       console.log("   2. 🔎 Verify the compile output");
-      console.log("   3. 📦 Build contracts + api packages");
+      console.log("   3. 📦 Build contracts + api + cli packages");
       console.log("   4. 🎯 Launch the CLI (deploy / join)\n");
 
       // Step 1: compile only the HTLC contract
@@ -196,7 +216,6 @@ class MidnightDeployer {
         this.projectRoot,
         "Building @umbra-otc/api",
       );
-
       await this.runCommand(
         "corepack",
         ["yarn", "workspace", "@umbra-otc/cli", "build"],
@@ -209,25 +228,45 @@ class MidnightDeployer {
       if (!fs.existsSync(launcher)) {
         console.log("\n✅ Contract compiled and packages built.");
         console.log(
-          "⚠️  packages/cli is not built, so there is nothing to deploy with yet.",
+          "⚠️  packages/cli/dist/launcher/preview.js was not produced by the build.",
         );
         console.log(
-          "   The CLI (wallet + providers) still targets the old stack and must be",
+          "   Check that packages/cli/src/launcher/preview.ts exists and that the",
         );
         console.log(
-          "   migrated to Midnight.js 5 / wallet SDK 2 before it can deploy.",
+          "   cli tsconfig compiles src/ to dist/ (rootDir: src, outDir: dist).",
         );
         return;
       }
+
+      const env = {
+        MIDNIGHT_NETWORK: this.network,
+        // The launcher writes its public deploy log here.
+        HTLC_LOG_DIR: path.join(this.projectRoot, "deploy"),
+      };
+      if (this.deployMode === "join") {
+        env.HTLC_ADDRESS = this.address || process.env.HTLC_ADDRESS;
+      }
+
+      console.log(
+        "\nℹ️  The launcher syncs the wallet first. On a public network that can take a long time,",
+      );
+      console.log(
+        "   and a new wallet pauses until you fund it from the faucet it prints.",
+      );
+
       await this.runCommand(
-        "npm",
-        ["run", "preview"],
+        "node",
+        [launcher, this.deployMode],
         this.cliDir,
-        "Connecting to the network and deploying the contract",
-        { AUTO_DEPLOY: "true", DEPLOY_MODE: this.deployMode || "new" },
+        `Running HTLC launcher (${this.deployMode})`,
+        env,
       );
 
       console.log(`\n🎉 ${modeText} completed successfully!`);
+      console.log(
+        `📄 Public log: ${path.join(this.projectRoot, "deploy", `${this.network}-log.jsonl`)}`,
+      );
     } catch (error) {
       console.error("\n❌ Deployment failed:", error.message);
       console.error("\n🔧 Troubleshooting:");
@@ -247,7 +286,7 @@ class MidnightDeployer {
         "   - Your wallet has funds AND DUST on the target network",
       );
       console.error(
-        "   - WALLET_SEED is set in .env (or you will be prompted)\n",
+        "   - WALLET_SEED is set in .env / your shell, or a new seed is created in ~/.umbra-otc/<network>.json\n",
       );
       process.exit(1);
     }
@@ -261,25 +300,31 @@ class MidnightDeployer {
 Usage:
   npm run deploy                         Compile, build and deploy a new HTLC
   npm run deploy:new                     Same as above
-  npm run deploy:join                    Join an existing HTLC
+  npm run deploy:join -- --address=<a>   Attach to an existing HTLC
   npm run deploy -- --skip-compile       Reuse the existing compile output
+  npm run deploy -- --network=<name>     local | preview (default) | preprod | custom
   npm run deploy -- --dry-run            Show what would be executed
   npm run deploy -- --help               Show this help message
 
 What this does:
   1. Compiles packages/contracts/src/htlc.compact with the Compact CLI (${COMPACT_TOOLCHAIN})
   2. Verifies the compile output (contract/, keys/, zkir/)
-  3. Builds the contracts and api packages
-  4. Launches the CLI to deploy/join (when the CLI is built)
+  3. Builds the contracts, api and cli packages
+  4. Runs packages/cli/dist/launcher/preview.js to deploy/join
 
 Requirements:
   - Linux, macOS or WSL (the Compact compiler does not run in Windows shells)
   - Node.js ${MIN_NODE.join(".")}+ and \`corepack enable\`
   - The \`compact\` CLI with toolchain 0.36 installed (\`compact update 0.36\`)
+  - A proof server reachable at MIDNIGHT_PROOF_SERVER (default http://127.0.0.1:6300)
   - A wallet with funds and DUST on the target network
 
 Environment variables:
-  - WALLET_SEED: wallet seed, to skip manual entry (copy .env.example to .env)
+  - WALLET_SEED: hex wallet seed (copy .env.example to .env). If unset, a seed is
+    created and stored in ~/.umbra-otc/<network>.json
+  - HTLC_DEPLOY_ARGS: JSON array of constructor args for a new deploy
+  - HTLC_ADDRESS: contract address for join (or use --address=)
+  - MIDNIGHT_NETWORK: same as --network
   (COMPACT_HOME is no longer used.)
 `);
   }
@@ -287,6 +332,10 @@ Environment variables:
 
 // Handle command line arguments
 const args = process.argv.slice(2);
+const flagValue = (name) => {
+  const hit = args.find((a) => a.startsWith(`--${name}=`));
+  return hit ? hit.slice(name.length + 3) : undefined;
+};
 
 let deployMode = "new";
 if (args.includes("--join")) deployMode = "join";
@@ -294,6 +343,8 @@ else if (args.includes("--new")) deployMode = "new";
 
 const deployer = new MidnightDeployer(deployMode, {
   skipCompile: args.includes("--skip-compile"),
+  address: flagValue("address") ?? "",
+  network: flagValue("network") ?? process.env.MIDNIGHT_NETWORK ?? "preview",
 });
 
 if (args.includes("--help") || args.includes("-h")) {

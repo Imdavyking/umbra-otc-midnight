@@ -25,6 +25,7 @@
     "prepack": "yarn build"
   },
   "devDependencies": {
+    "@types/node": "^26.6.6",
     "@umbra-otc/compact": "workspace:*",
     "eslint": "^9.27.0",
     "typescript": "^5.8.2",

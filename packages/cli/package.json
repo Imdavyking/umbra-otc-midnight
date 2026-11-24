@@ -9,7 +9,6 @@
   },
   "scripts": {
     "preview": "node dist/launcher/preview.js",
-    "local": "node dist/launcher/local.js",
     "build": "rm -rf dist && tsc --project tsconfig.build.json",
     "lint": "eslint src"
   },
